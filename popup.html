@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PS AutoBook</title>
+    <link rel="stylesheet" href="popup.css">
+</head>
+
+<body>
+    <div class="app">
+
+        <!-- ── Header ── -->
+        <header class="topbar">
+            <div class="brand">
+                <div class="brand-icon">PS</div>
+                <div>
+                    <div class="brand-name">AutoBook</div>
+                    <div class="brand-sub">Slot Scheduler · BITS</div>
+                </div>
+            </div>
+            <div id="cookieStatus" class="session-pill">Checking…</div>
+        </header>
+
+        <!-- ── Status Banner ── -->
+        <div id="statusBanner" class="banner banner-idle">
+            <div class="banner-left">
+                <div id="statusDot" class="banner-dot"></div>
+                <div>
+                    <div id="statusTitle" class="banner-title">Ready</div>
+                    <div id="statusDetail" class="banner-detail">Configure below and schedule</div>
+                </div>
+            </div>
+            <div class="banner-right">
+                <div id="countdown" class="cd-wrap" style="display:none">
+                    <div id="cdTime" class="cd-time">--:--:--</div>
+                    <div class="cd-label">until trigger</div>
+                </div>
+                <button id="bannerStopBtn" class="banner-stop-btn" style="display:none">&#x25A0; Stop Schedule</button>
+            </div>
+        </div>
+
+        <!-- ── Config Card ── -->
+        <div class="card">
+            <div class="card-header">
+                <span class="section-label">Configuration</span>
+                <button id="fetchBtn" class="btn-sm btn-outline">Fetch Slots</button>
+            </div>
+            <div class="row2">
+                <div class="field">
+                    <label>Course ID</label>
+                    <input id="courseId" type="number" placeholder="e.g. 65">
+                </div>
+                <div class="field">
+                    <label>Register ID</label>
+                    <input id="registerId" type="number" placeholder="e.g. 1289353">
+                </div>
+            </div>
+            <div class="field">
+                <label>Preferred Slot Time</label>
+                <select id="slotTime">
+                    <option value="any">— Any available slot —</option>
+                    <option value="first-in-range">First available in time range</option>
+                    <option value="custom">Custom range (start–end)</option>
+                    <option value="8:45 to 9:45">8:45 AM – 9:45 AM</option>
+                    <option value="8:45 to 10:15">8:45 AM – 10:15 AM</option>
+                    <option value="10:45 to 12:15">10:45 am - 12:15 pm</option>
+                    <option value="11:20 to 12:20">11:20 AM – 12:20 PM</option>
+                    <option value="15:25 to 16:25">3:25 PM – 4:25 PM</option>
+                    <option value="16:40 to 17:40">4:40 PM – 5:40 PM</option>
+                    <option value="16:45 to 17:45">4:45 PM – 5:45 PM</option>
+                    <option value="13:30 to 15:00">1:30 PM – 3:00 PM</option>
+                </select>
+            </div>
+            <div id="customRangeWrap" class="field custom-range" style="display:none">
+                <label>Custom Range (Start → End)</label>
+                <div class="range-row">
+                    <input id="customStart" type="time" step="60">
+                    <span class="range-sep">to</span>
+                    <input id="customEnd" type="time" step="60">
+                </div>
+                <div class="range-help">Books the first slot that starts within this time range.</div>
+            </div>
+            <div id="firstInRangeWrap" class="field custom-range" style="display:none">
+                <label>Time Range — Books earliest available slot in this window</label>
+                <div class="range-row">
+                    <input id="firStart" type="time" step="60">
+                    <span class="range-sep">to</span>
+                    <input id="firEnd" type="time" step="60">
+                </div>
+                <div class="range-help">Fetches all slots, sorts by start time, and books the earliest slot that starts
+                    within your range.</div>
+            </div>
+            <div class="field">
+                <label>Preferred Slot Date</label>
+                <input id="slotDate" type="date">
+            </div>
+        </div>
+
+        <!-- ── Available Slots ── -->
+        <div class="card">
+            <div class="card-header">
+                <span class="section-label">Available Slots</span>
+                <span id="slotCount" class="badge-count" style="display:none">0 slots</span>
+            </div>
+            <div id="slotsBox" class="slots-container">
+                <div class="empty-state">Enter Course ID and click <strong>Fetch Slots</strong></div>
+            </div>
+        </div>
+
+        <!-- ── Manual Book ── -->
+        <div class="card">
+            <div class="card-header">
+                <span class="section-label">Manual Book</span>
+            </div>
+            <div class="book-row">
+                <div class="field" style="flex:1; margin:0">
+                    <label>Slot ID</label>
+                    <input id="slotId" type="number" placeholder="Click slot above or enter ID">
+                </div>
+                <button id="bookBtn" class="btn-book">Book Now</button>
+            </div>
+            <div id="bookResult" class="result-box" style="display:none"></div>
+        </div>
+
+        <!-- ── Schedule Card ── -->
+        <div class="card">
+            <div class="card-header">
+                <span class="section-label">Schedule</span>
+                <span class="hint-text">Auto-opens PS &amp; books at trigger time</span>
+            </div>
+            <div class="toggle-row">
+                <div class="toggle-info">
+                    <span class="toggle-label">Page Reload</span>
+                    <span class="toggle-desc">Open/reload PS tab before booking (slower but refreshes cookies)</span>
+                </div>
+                <label class="toggle-switch">
+                    <input type="checkbox" id="pageReloadToggle">
+                    <span class="toggle-thumb"></span>
+                </label>
+            </div>
+            <label class="field-label">Trigger Time</label>
+            <div class="timepicker">
+                <div class="tp-col">
+                    <button class="tp-arrow" data-field="tpH" data-dir="1">▲</button>
+                    <input id="tpH" class="tp-digit" type="text" value="08" maxlength="2" inputmode="numeric">
+                    <button class="tp-arrow" data-field="tpH" data-dir="-1">▼</button>
+                    <span class="tp-unit">HR</span>
+                </div>
+                <span class="tp-sep">:</span>
+                <div class="tp-col">
+                    <button class="tp-arrow" data-field="tpM" data-dir="1">▲</button>
+                    <input id="tpM" class="tp-digit" type="text" value="00" maxlength="2" inputmode="numeric">
+                    <button class="tp-arrow" data-field="tpM" data-dir="-1">▼</button>
+                    <span class="tp-unit">MIN</span>
+                </div>
+                <span class="tp-sep">:</span>
+                <div class="tp-col">
+                    <button class="tp-arrow" data-field="tpS" data-dir="1">▲</button>
+                    <input id="tpS" class="tp-digit" type="text" value="00" maxlength="2" inputmode="numeric">
+                    <button class="tp-arrow" data-field="tpS" data-dir="-1">▼</button>
+                    <span class="tp-unit">SEC</span>
+                </div>
+                <div class="tp-col">
+                    <button class="tp-arrow" data-field="tpAP" data-dir="1">▲</button>
+                    <div id="tpAP" class="tp-ampm">PM</div>
+                    <button class="tp-arrow" data-field="tpAP" data-dir="-1">▼</button>
+                </div>
+            </div>
+            <div class="btn-row">
+                <button id="scheduleBtn" class="btn-primary">Schedule</button>
+                <button id="runNowBtn" class="btn-success">Run Now</button>
+                <button id="cancelBtn" class="btn-danger">Cancel</button>
+            </div>
+        </div>
+
+        <!-- ── Activity Log ── -->
+        <div class="card" style="margin-bottom:16px">
+            <div class="card-header">
+                <span class="section-label">Activity Log</span>
+                <div class="log-actions">
+                    <button id="refreshLogBtn" class="btn-sm btn-ghost">Refresh</button>
+                    <button id="clearLogBtn" class="btn-sm btn-ghost">Clear</button>
+                </div>
+            </div>
+            <pre id="logBox" class="log-box">No logs yet.</pre>
+        </div>
+
+    </div>
+    <script src="popup.js"></script>
+</body>
+
+</html>
