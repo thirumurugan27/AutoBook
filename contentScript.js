@@ -1,13 +1,7 @@
-// contentScript.js — runs on ps.bitsathy.ac.in pages
-// Handles booking and session checks.
-
-
-
-// ── Message listener ─────────────────────────────────────────
+// contentScript.js
 chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
     if (!msg) return;
 
-    // ── Session check ──
     if (msg.action === "checkSessionFromPage") {
         fetch("https://ps.bitsathy.ac.in/api/ps_v2/resources", {
             method: "GET",
@@ -23,7 +17,6 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
         return true;
     }
 
-    // ── Slot booking ──
     if (msg.action !== "pageBookSlot") return;
 
     var payload = msg.payload || {};

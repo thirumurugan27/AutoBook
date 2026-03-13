@@ -1,8 +1,8 @@
-// background.js — PS AutoBook Service Worker (Fixed v3)
-var BASE = "https://ps.bitsathy.ac.in/api/ps_v2/slots";
+// background.js
+var API_BASE = "https://ps.bitsathy.ac.in/api/ps_v2";
+var BASE = API_BASE + "/slots";
 
-// ===== Keep Service Worker Alive =====
-// Service workers terminate after ~30s of inactivity. This keeps it alive during booking.
+// keep service worker alive during booking
 var keepAliveTimer = null;
 
 function startKeepAlive() {
@@ -19,7 +19,7 @@ function stopKeepAlive() {
     }
 }
 
-// ===== Helpers =====
+// helpers
 function normalizeTime(str) {
     return str.replace(/\s+/g, "").replace(/am|pm/gi, "").replace(/^0/, "").toLowerCase().trim();
 }
@@ -138,6 +138,352 @@ function delay(ms) {
     return new Promise(function (resolve) {
         setTimeout(resolve, ms);
     });
+}
+
+function runWithTimeout(promise, ms, fallbackValue) {
+    return Promise.race([
+        promise,
+        new Promise(function (resolve) {
+            setTimeout(function () {
+                resolve(fallbackValue);
+            }, ms);
+        })
+    ]);
+}
+
+function toNumString(v) {
+    if (v === null || v === undefined) return "";
+    var s = String(v).trim();
+    return /^\d+$/.test(s) ? s : "";
+}
+
+function toPositiveInt(v) {
+    var s = toNumString(v);
+    if (!s) return 0;
+    var n = parseInt(s, 10);
+    return isNaN(n) || n <= 0 ? 0 : n;
+}
+
+function toPositiveNumStrings(arr) {
+    var out = [];
+    (arr || []).forEach(function (v) {
+        var n = toPositiveInt(v);
+        if (n > 0) out.push(String(n));
+    });
+    return uniq(out);
+}
+
+function sortNumStringsAsc(arr) {
+    return (arr || []).slice().sort(function (a, b) { return parseInt(a, 10) - parseInt(b, 10); });
+}
+
+function sortNumStringsDesc(arr) {
+    return (arr || []).slice().sort(function (a, b) { return parseInt(b, 10) - parseInt(a, 10); });
+}
+
+function pickRegisterId(regCandidates, idCandidates) {
+    var regs = sortNumStringsDesc(toPositiveNumStrings((regCandidates || []).concat(idCandidates || [])));
+    if (!regs.length) return "";
+    for (var i = 0; i < regs.length; i++) {
+        if (parseInt(regs[i], 10) >= 100000) return regs[i];
+    }
+    return regs[0];
+}
+
+function pickCourseId(courseCandidates, idCandidates, registerId) {
+    var regNum = toPositiveInt(registerId);
+    var courses = toPositiveNumStrings(courseCandidates || []).filter(function (v) {
+        return parseInt(v, 10) !== regNum;
+    });
+    if (courses.length) return sortNumStringsAsc(courses)[0];
+
+    var fromIds = toPositiveNumStrings(idCandidates || []).filter(function (v) {
+        var n = parseInt(v, 10);
+        return n !== regNum && n < 100000;
+    });
+    if (fromIds.length) return sortNumStringsAsc(fromIds)[0];
+    return "";
+}
+
+function collectKeyValues(node, out) {
+    if (node === null || node === undefined) return;
+    if (Array.isArray(node)) {
+        for (var i = 0; i < node.length; i++) collectKeyValues(node[i], out);
+        return;
+    }
+    if (typeof node !== "object") return;
+    Object.keys(node).forEach(function (k) {
+        var lk = String(k).toLowerCase();
+        var v = node[k];
+        if (typeof v === "number" || typeof v === "string") {
+            if (!out[lk]) out[lk] = [];
+            out[lk].push(v);
+        }
+        collectKeyValues(v, out);
+    });
+}
+
+function uniq(arr) {
+    var seen = {};
+    var out = [];
+    (arr || []).forEach(function (v) {
+        var key = String(v);
+        if (!seen[key]) {
+            seen[key] = true;
+            out.push(v);
+        }
+    });
+    return out;
+}
+
+function getCandidatesByKeyMap(keyMap, includes) {
+    var vals = [];
+    Object.keys(keyMap || {}).forEach(function (k) {
+        for (var i = 0; i < includes.length; i++) {
+            if (k.indexOf(includes[i]) !== -1) {
+                vals = vals.concat(keyMap[k]);
+                break;
+            }
+        }
+    });
+    return uniq(vals.map(toNumString).filter(Boolean));
+}
+
+function pickCourseName(raw) {
+    var nameKeys = ["course_name", "coursename", "course", "title", "name", "skill", "skill_name", "subject_name"];
+    for (var i = 0; i < nameKeys.length; i++) {
+        var key = nameKeys[i];
+        if (raw && raw[key] && String(raw[key]).trim()) return String(raw[key]).trim();
+    }
+    var queue = [raw];
+    while (queue.length) {
+        var node = queue.shift();
+        if (!node || typeof node !== "object") continue;
+        Object.keys(node).forEach(function (k) {
+            var v = node[k];
+            var lk = String(k).toLowerCase();
+            if (typeof v === "string" && v.trim()) {
+                if (nameKeys.some(function (nk) { return lk.indexOf(nk) !== -1; })) {
+                    queue.length = 0;
+                    raw.__pickedName = v.trim();
+                    return;
+                }
+            }
+            if (v && typeof v === "object") queue.push(v);
+        });
+    }
+    return raw && raw.__pickedName ? raw.__pickedName : "";
+}
+
+function parseAnyArray(data) {
+    if (Array.isArray(data)) return data;
+    if (data && typeof data === "object") {
+        var keys = ["data", "list", "items", "result", "courses", "my_courses", "registered_courses"];
+        for (var i = 0; i < keys.length; i++) {
+            if (Array.isArray(data[keys[i]])) return data[keys[i]];
+        }
+    }
+    return [];
+}
+
+function normalizeCourseRecord(raw, index) {
+    var keyMap = {};
+    collectKeyValues(raw, keyMap);
+    var idCandidates = toPositiveNumStrings((keyMap.id || []));
+    var regCandidates = getCandidatesByKeyMap(keyMap, ["register", "registration", "reg_id", "regid", "student_course", "studentcourse", "r"]);
+    var courseCandidates = getCandidatesByKeyMap(keyMap, ["course_id", "courseid", "cid", "subject_id", "skill_id"]);
+
+    var registerId = pickRegisterId(regCandidates, idCandidates);
+    var courseId = pickCourseId(courseCandidates, idCandidates, registerId);
+    var courseName = pickCourseName(raw) || ("Course " + (index + 1));
+    var safeName = courseName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 30) || "course";
+    var key = "course_" + index + "_" + (registerId || "na") + "_" + (courseId || "na") + "_" + safeName;
+
+    return {
+        key: key,
+        name: courseName,
+        courseId: courseId,
+        registerId: registerId,
+        courseCandidates: uniq(toPositiveNumStrings(courseCandidates).concat(courseId ? [courseId] : [])),
+        registerCandidates: uniq(toPositiveNumStrings(regCandidates).concat(registerId ? [registerId] : []))
+    };
+}
+
+async function apiGet(path) {
+    var cookieStr = await getCookieHeader();
+    var headers = { "Accept": "application/json" };
+    if (cookieStr) headers["Cookie"] = cookieStr;
+
+    var response = await fetch(API_BASE + path, {
+        method: "GET",
+        credentials: "include",
+        headers: headers
+    });
+
+    var txt = await response.text();
+    if (!response.ok) {
+        throw new Error("HTTP " + response.status + ": " + txt.substring(0, 200));
+    }
+
+    try {
+        return JSON.parse(txt);
+    } catch (e) {
+        return { raw: txt };
+    }
+}
+
+async function fetchRegisteredCourses() {
+    var data = null;
+
+    // Primary: proxy through PS page content script (runs on ps.bitsathy.ac.in origin)
+    var tabId = await getPsTabId();
+    if (tabId) {
+        await ensureContentScriptInTab(tabId);
+        var pageResp = await runWithTimeout(
+            sendMessageToTab(tabId, { action: "fetchRegisteredCourses" }),
+            10000,
+            null
+        );
+        if (pageResp && pageResp.ok && pageResp.data) {
+            data = pageResp.data;
+        } else {
+            addLog("[COURSES] Page proxy failed — falling back to direct API");
+        }
+    }
+
+    // Fallback: direct fetch with explicit cookies from background
+    if (!data) {
+        data = await apiGet("/my-course?tab=personalizedSkills");
+    }
+
+    var list = parseAnyArray(data);
+    var normalized = list.map(function (item, i) {
+        return normalizeCourseRecord(item, i);
+    }).filter(function (c) {
+        return c && c.name;
+    });
+
+    var st = await chrome.storage.local.get("courseMapByRegister");
+    var map = (st && st.courseMapByRegister) || {};
+    normalized.forEach(function (c) {
+        if (!c.registerId) return;
+        var mappedCourse = toNumString(map[c.registerId]);
+        if (mappedCourse && !c.courseId) {
+            c.courseId = mappedCourse;
+        }
+        if (mappedCourse && c.courseCandidates.indexOf(mappedCourse) === -1) {
+            c.courseCandidates.push(mappedCourse);
+        }
+    });
+
+    return uniq(normalized.map(function (c) { return JSON.stringify(c); })).map(function (s) { return JSON.parse(s); });
+}
+
+function parseCourseAndRegisterFromAny(data) {
+    var keyMap = {};
+    collectKeyValues(data, keyMap);
+    var courseCandidates = getCandidatesByKeyMap(keyMap, ["course_id", "courseid", "cid", "subject_id", "skill_id"]);
+    var regCandidates = getCandidatesByKeyMap(keyMap, ["register", "registration", "reg_id", "regid", "student_course", "studentcourse", "r"]);
+    var idCandidates = toPositiveNumStrings((keyMap.id || []));
+    var registerId = pickRegisterId(regCandidates, idCandidates);
+    var courseId = pickCourseId(courseCandidates, idCandidates, registerId);
+    return {
+        courseId: courseId,
+        registerId: registerId,
+        courseCandidates: uniq(toPositiveNumStrings(courseCandidates).concat(courseId ? [courseId] : [])),
+        registerCandidates: uniq(toPositiveNumStrings(regCandidates).concat(registerId ? [registerId] : []))
+    };
+}
+
+async function fetchCourseDetailsViaPage(registerId) {
+    var tabId = await getPsTabId();
+    if (!tabId) return null;
+    await ensureContentScriptInTab(tabId);
+    var resp = await sendMessageToTab(tabId, { action: "getCourseDetails", registerId: String(registerId) });
+    if (!resp || !resp.ok || !resp.data) return null;
+    return resp.data;
+}
+
+function extractCourseIdFromDetails(data, knownRegisterId) {
+    if (!data) return { courseId: "", registerId: knownRegisterId || "" };
+    var keyMap = {};
+    collectKeyValues(data, keyMap);
+
+    var idCandidates = toPositiveNumStrings(keyMap.id || []);
+    var regCandidates = getCandidatesByKeyMap(keyMap, ["register", "registration", "reg_id", "regid", "student_course", "studentcourse"]);
+    var courseCandidates = getCandidatesByKeyMap(keyMap, ["course_id", "courseid", "cid", "subject_id", "skill_id"]);
+
+    var rid = pickRegisterId(regCandidates, idCandidates.concat(knownRegisterId ? [knownRegisterId] : []));
+    if (!rid && knownRegisterId) rid = String(knownRegisterId);
+
+    var cid = pickCourseId(courseCandidates, idCandidates, rid);
+
+    // fallback: pick smallest id that isn't the register id
+    if (!cid && idCandidates.length) {
+        var ridNum = parseInt(rid || "0", 10);
+        var smalls = idCandidates
+            .filter(function (v) { return parseInt(v, 10) !== ridNum && parseInt(v, 10) < 100000; })
+            .sort(function (a, b) { return parseInt(a, 10) - parseInt(b, 10); });
+        if (smalls.length) cid = smalls[0];
+    }
+
+    return { courseId: cid || "", registerId: rid || knownRegisterId || "" };
+}
+
+async function resolveCourseSelection(selection) {
+    var courseId = toNumString(selection && selection.courseId);
+    var registerId = toNumString(selection && selection.registerId);
+    var registerCandidates = uniq(toPositiveNumStrings((selection && selection.registerCandidates) || []));
+
+    // pick register id
+    var allRegIds = uniq([registerId].concat(registerCandidates).filter(Boolean));
+    registerId = pickRegisterId(allRegIds, allRegIds) || registerId;
+
+    // check cache
+    if (registerId && (!courseId || !isValidCourseId(courseId))) {
+        var st = await chrome.storage.local.get("courseMapByRegister");
+        var map = (st && st.courseMapByRegister) || {};
+        var cached = toNumString(map[registerId]);
+        if (cached && isValidCourseId(cached)) courseId = cached;
+    }
+
+    // fetch course details to resolve ids
+    if (!courseId || !isValidCourseId(courseId)) {
+        var toTry = uniq([registerId].concat(registerCandidates).filter(Boolean));
+        for (var i = 0; i < toTry.length; i++) {
+            var rc = toTry[i];
+            if (!rc) continue;
+            try {
+                var data = await fetchCourseDetailsViaPage(rc);
+                if (!data) data = await apiGet("/my-course/details?id=" + rc + "&courseMaterial=1");
+                var extracted = extractCourseIdFromDetails(data, rc);
+
+                if (!registerId && extracted.registerId) registerId = extracted.registerId;
+                if (extracted.courseId && isValidCourseId(extracted.courseId)) {
+                    courseId = extracted.courseId;
+                    var stMap = await chrome.storage.local.get("courseMapByRegister");
+                    var mapByReg = (stMap && stMap.courseMapByRegister) || {};
+                    mapByReg[rc] = courseId;
+                    chrome.storage.local.set({ courseMapByRegister: mapByReg });
+                }
+
+                if (courseId && isValidCourseId(courseId) && registerId) break;
+            } catch (e) {
+                addLog("course details fetch failed for " + rc + ": " + e.message);
+            }
+        }
+    }
+
+    if (!registerId || !courseId || !isValidCourseId(courseId)) {
+        throw new Error("Could not resolve course IDs");
+    }
+
+    return { courseId: courseId, registerId: registerId };
+}
+
+function isValidCourseId(v) {
+    var n = parseInt(String(v || ""), 10);
+    return !isNaN(n) && n > 0 && n < 100000;
 }
 
 function parseSlotsFromData(data) {
@@ -371,11 +717,23 @@ async function bookSlotViaPage(slotId, registerId) {
 
 // ===== API Calls (with explicit cookies) =====
 async function fetchSlots(courseId) {
+    // Primary: proxy through PS page content script (runs on ps.bitsathy.ac.in origin)
+    var tabId = await getPsTabId();
+    if (tabId) {
+        await ensureContentScriptInTab(tabId);
+        var pageResp = await runWithTimeout(
+            sendMessageToTab(tabId, { action: "fetchSlots", courseId: String(courseId) }),
+            10000,
+            null
+        );
+        if (pageResp && pageResp.ok) return pageResp.data;
+        addLog("[SLOTS] Page proxy failed — falling back to direct API");
+    }
+
+    // Fallback: direct fetch with explicit cookies from background
     var cookieStr = await getCookieHeader();
     var headers = { "Accept": "application/json" };
     if (cookieStr) headers["Cookie"] = cookieStr;
-
-    addLog("[FETCH] GET /available?id=" + courseId + " | Cookies: " + (cookieStr ? cookieStr.length + " chars" : "NONE!"));
 
     var response = await fetch(BASE + "/available?id=" + courseId, {
         method: "GET",
@@ -392,13 +750,7 @@ async function fetchSlots(courseId) {
 }
 
 async function doBookSlot(slotId, registerId) {
-    // Always route through the content script running inside ps.bitsathy.ac.in.
-    // Direct fetches from the extension background get 403 Forbidden due to CORS/CSRF
-    // (server rejects Origin: chrome-extension://...). The content script runs in the
-    // page origin so credentials + session cookies are always included correctly.
-    addLog("[BOOK] Routing via page origin (content script) to avoid CORS/403...");
     var result = await bookSlotViaPage(slotId, registerId);
-    addLog("[PAGE BOOK] Success via page origin");
     return result;
 }
 
@@ -775,6 +1127,35 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
             if (msg.action === "fetchSlots") {
                 var slots = await fetchSlots(msg.courseId);
                 respond({ ok: true, data: slots });
+                return;
+            }
+
+            if (msg.action === "fetchRegisteredCourses" || msg.action === "fetcRegisteredCourses" || msg.action === "fetchRegistredCourses" || msg.action === "fetchCourses") {
+                var courses = await fetchRegisteredCourses();
+                respond({ ok: true, data: courses });
+                return;
+            }
+
+            if (msg.action === "resolveCourseSelection" || msg.action === "resolveSelectedCourse" || msg.action === "resolveCourseIds") {
+                var resolved = await resolveCourseSelection(msg.selection || {});
+                respond({ ok: true, data: resolved });
+                return;
+            }
+
+            if (msg.action === "reportCourseMaterialMapping") {
+                var data = msg.data || {};
+                var cid = toNumString(data.courseId);
+                var rid = toNumString(data.registerId);
+                if (!cid || !rid) {
+                    respond({ ok: true, ignored: true });
+                    return;
+                }
+                var stMap = await chrome.storage.local.get("courseMapByRegister");
+                var mapByReg = (stMap && stMap.courseMapByRegister) || {};
+                mapByReg[rid] = cid;
+                await chrome.storage.local.set({ courseMapByRegister: mapByReg, lastCourseMaterialCapture: { courseId: cid, registerId: rid, at: Date.now() } });
+                addLog("[COURSE-MAP] Captured course/register from page: C:" + cid + " R:" + rid);
+                respond({ ok: true });
                 return;
             }
 

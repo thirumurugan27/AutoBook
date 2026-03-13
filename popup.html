@@ -45,16 +45,34 @@
         <div class="card">
             <div class="card-header">
                 <span class="section-label">Configuration</span>
-                <button id="fetchBtn" class="btn-sm btn-outline">Fetch Slots</button>
+                <div class="cfg-actions">
+                    <button id="loadCoursesBtn" class="btn-sm btn-ghost">Load Courses</button>
+                    <button id="fetchBtn" class="btn-sm btn-outline">Fetch Slots</button>
+                </div>
+            </div>
+            <div class="field">
+                <label>Registered Course</label>
+                <div class="course-picker-wrap">
+                    <div class="course-picker" id="coursePicker">
+                        <input id="courseSearchInput" type="text" placeholder="Search course name..."
+                            autocomplete="off">
+                        <button id="courseDropdownBtn" class="course-dd-btn" type="button"
+                            aria-label="Toggle course list">▼</button>
+                    </div>
+                    <div id="courseOptions" class="course-options" style="display:none"></div>
+                </div>
+                <select id="courseSelect" style="display:none">
+                    <option value="">-- Select a registered course --</option>
+                </select>
             </div>
             <div class="row2">
                 <div class="field">
                     <label>Course ID</label>
-                    <input id="courseId" type="number" placeholder="e.g. 65">
+                    <input id="courseId" type="number" placeholder="Auto-filled from selected course" readonly>
                 </div>
                 <div class="field">
                     <label>Register ID</label>
-                    <input id="registerId" type="number" placeholder="e.g. 1289353">
+                    <input id="registerId" type="number" placeholder="Auto-filled from selected course" readonly>
                 </div>
             </div>
             <div class="field">
@@ -105,7 +123,7 @@
                 <span id="slotCount" class="badge-count" style="display:none">0 slots</span>
             </div>
             <div id="slotsBox" class="slots-container">
-                <div class="empty-state">Enter Course ID and click <strong>Fetch Slots</strong></div>
+                <div class="empty-state">Select a course and click <strong>Fetch Slots</strong></div>
             </div>
         </div>
 

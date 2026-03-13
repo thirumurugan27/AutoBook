@@ -1,9 +1,12 @@
-﻿// popup.js — PS AutoBook v3
-// ============================================================
-// ELEMENT REFS
-// ============================================================
+﻿// popup.js
 var $courseId = document.getElementById("courseId");
 var $registerId = document.getElementById("registerId");
+var $courseSelect = document.getElementById("courseSelect");
+var $coursePicker = document.getElementById("coursePicker");
+var $courseSearchInput = document.getElementById("courseSearchInput");
+var $courseDropdownBtn = document.getElementById("courseDropdownBtn");
+var $courseOptions = document.getElementById("courseOptions");
+var $loadCoursesBtn = document.getElementById("loadCoursesBtn");
 var $slotTime = document.getElementById("slotTime");
 var $slotDate = document.getElementById("slotDate");
 var $customRangeWrap = document.getElementById("customRangeWrap");
@@ -38,6 +41,8 @@ var $tpAP = document.getElementById("tpAP");
 var $pageReloadToggle = document.getElementById("pageReloadToggle");
 
 var _lastRenderedFetchAt = 0;
+var _courseList = [];
+var _courseDropdownOpen = false;
 
 // ============================================================
 // UTILS
@@ -77,7 +82,6 @@ function slotMatchesDateForDisplay(slot, preferredDate) {
     return sd && sd === preferredDate;
 }
 
-// Mirror of the background.js time-matching logic so the popup can check matches locally
 function normalizeTimeLocal(str) {
     return String(str).replace(/\s+/g, "").replace(/am|pm/gi, "").replace(/^0/, "").toLowerCase().trim();
 }
@@ -102,10 +106,8 @@ function parseTimeToMinutesLocal(str) {
 
 function extractFirstTimeMinutesLocal(text) {
     if (!text) return null;
-    // Try AM/PM format first (e.g. "8:45 AM", "3:25 pm")
     var m = String(text).match(/\d{1,2}(?::\d{2})?\s*[ap]m/i);
     if (m) return parseTimeToMinutesLocal(m[0]);
-    // Fallback: 24h format (e.g. "08:45", "15:25")
     var m2 = String(text).match(/(\d{1,2}):(\d{2})/);
     if (m2) return parseTimeToMinutesLocal(m2[0]);
     return null;
@@ -138,7 +140,6 @@ function slotMatchesTimeLocal(slot, preferredTime, customStart, customEnd, firSt
     if (preferredTime === "first-in-range") {
         return slotMatchesCustomRangeLocal(slot, firStartVal, firEndVal);
     }
-    // Primary: minute-based range comparison (handles 12h/24h mismatch)
     var parts = preferredTime.split(/\s*to\s*/i);
     if (parts.length === 2) {
         var rangeStart = parseTimeToMinutesLocal(parts[0].trim());
@@ -150,7 +151,6 @@ function slotMatchesTimeLocal(slot, preferredTime, customStart, customEnd, firSt
             }
         }
     }
-    // Fallback: substring search in JSON (for non-range preferences)
     var norm = normalizeTimeLocal(preferredTime);
     var hay = JSON.stringify(slot).toLowerCase();
     if (hay.indexOf(norm) !== -1) return true;
@@ -227,6 +227,28 @@ function bgMsg(msg, attempt) {
     });
 }
 
+function bgMsgWithActionFallback(actions, payload) {
+    var list = Array.isArray(actions) ? actions.slice() : [actions];
+    var idx = 0;
+
+    function next(lastErr) {
+        if (idx >= list.length) {
+            return Promise.reject(lastErr || new Error("No action available"));
+        }
+        var action = list[idx++];
+        var req = Object.assign({}, payload || {}, { action: action });
+        return bgMsg(req).catch(function (err) {
+            var msg = String(err && err.message || "");
+            if (/unknown action/i.test(msg) || /no response from background/i.test(msg)) {
+                return next(err);
+            }
+            throw err;
+        });
+    }
+
+    return next();
+}
+
 function ensureBgReady() {
     return new Promise(function (resolve, reject) {
         var tries = 0;
@@ -263,6 +285,19 @@ function localLog(msg) {
         logs.push("[" + new Date().toLocaleTimeString() + "] " + msg);
         if (logs.length > 150) logs.splice(0, logs.length - 150);
         chrome.storage.local.set({ autoLog: logs });
+    });
+}
+
+function withTimeout(promise, ms, timeoutMessage) {
+    var timeoutId = null;
+    var timeoutPromise = new Promise(function (_, reject) {
+        timeoutId = setTimeout(function () {
+            reject(new Error(timeoutMessage || "Request timed out"));
+        }, ms);
+    });
+
+    return Promise.race([promise, timeoutPromise]).finally(function () {
+        if (timeoutId) clearTimeout(timeoutId);
     });
 }
 
@@ -312,16 +347,13 @@ function tickCD() {
     var diff = cdTarget - Date.now();
     if (diff <= 0) {
         stopCD();
-        // If alarm hasn't fired yet (status still "scheduled"), trigger auto-book immediately
-        // Chrome alarms can fire 30–60s late due to minimum-delay constraints.
         chrome.storage.local.get(["autoStatus", "autoEnabled"], function (r) {
             if (r.autoEnabled && r.autoStatus === "scheduled") {
-                localLog("[PRECISION] Countdown hit 0 — triggering auto-book now (alarm may be delayed)");
-                chrome.storage.local.set({ autoStatus: "running", autoDetail: "Triggered by precision timer…" }, function () {
+                chrome.storage.local.set({ autoStatus: "running", autoDetail: "Running..." }, function () {
                     ensureBgReady().then(function () {
                         return bgMsg({ action: "runNow" });
                     }).catch(function (e) {
-                        localLog("[PRECISION ERROR] " + e.message);
+                        localLog("auto-book error: " + e.message);
                     });
                 });
             } else {
@@ -526,6 +558,232 @@ function renderFetchedSlots(slots, matchedSlotId) {
     });
 }
 
+function isDigits(v) {
+    return /^\d+$/.test(String(v || "").trim());
+}
+
+function isValidId(v) {
+    if (!isDigits(v)) return false;
+    return parseInt(String(v), 10) > 0;
+}
+
+function syncResolvedIds(courseId, registerId) {
+    $courseId.value = String(courseId || "");
+    $registerId.value = String(registerId || "");
+    chrome.storage.local.set({
+        courseId: $courseId.value,
+        registerId: $registerId.value
+    });
+}
+
+function courseMetaLabel(course) {
+    var parts = [];
+    if (isValidId(course.courseId)) parts.push("C:" + course.courseId);
+    if (isValidId(course.registerId)) parts.push("R:" + course.registerId);
+    return parts.length ? parts.join("  ·  ") : "IDs will be resolved when selected";
+}
+
+function setCoursePickerOpen(open) {
+    _courseDropdownOpen = !!open;
+    if ($courseOptions) $courseOptions.style.display = open ? "" : "none";
+    if ($coursePicker) {
+        if (open) $coursePicker.classList.add("open");
+        else $coursePicker.classList.remove("open");
+    }
+}
+
+function getCourseSearchTerm() {
+    return String($courseSearchInput && $courseSearchInput.value || "").trim().toLowerCase();
+}
+
+function filteredCourses(query) {
+    var q = String(query || "").trim().toLowerCase();
+    if (!q) return _courseList.slice();
+    return _courseList.filter(function (course) {
+        var hay = [course.name, course.courseId, course.registerId].join(" ").toLowerCase();
+        return hay.indexOf(q) !== -1;
+    });
+}
+
+function updateCourseSearchDisplay() {
+    if (!$courseSearchInput) return;
+    var selected = getSelectedCourse();
+    if (selected) {
+        $courseSearchInput.value = selected.name;
+        return;
+    }
+    $courseSearchInput.value = "";
+}
+
+function renderCourseDropdown(query) {
+    if (!$courseOptions) return;
+
+    var list = filteredCourses(query);
+    var selected = getSelectedCourse();
+    var selectedKey = selected ? selected.key : "";
+
+    $courseOptions.innerHTML = '<div class="course-options-inner"></div>';
+    var inner = $courseOptions.querySelector(".course-options-inner");
+    if (!inner) return;
+
+    if (list.length === 0) {
+        inner.innerHTML = '<div class="course-empty">No course matches your search</div>';
+        return;
+    }
+
+    list.forEach(function (course) {
+        var btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "course-opt" + (selectedKey === course.key ? " active" : "");
+        btn.innerHTML =
+            '<div class="course-opt-name">' + course.name + '</div>' +
+            '<div class="course-opt-meta">' + courseMetaLabel(course) + '</div>';
+        btn.addEventListener("click", function () {
+            $courseSelect.value = course.key;
+            chrome.storage.local.set({ selectedCourseKey: course.key });
+            updateCourseSearchDisplay();
+            setCoursePickerOpen(false);
+            $courseSelect.dispatchEvent(new Event("change"));
+        });
+        inner.appendChild(btn);
+    });
+}
+
+function renderCourseOptions(selectedKey) {
+    if (!$courseSelect) return;
+
+    $courseSelect.innerHTML = '<option value="">-- Select a registered course --</option>';
+    _courseList.forEach(function (course) {
+        var opt = document.createElement("option");
+        opt.value = course.key;
+        opt.textContent = course.name;
+        $courseSelect.appendChild(opt);
+    });
+
+    if (selectedKey && _courseList.some(function (c) { return c.key === selectedKey; })) {
+        $courseSelect.value = selectedKey;
+    } else if (_courseList.length > 0) {
+        // Keep selection deterministic when list refresh changes keys.
+        $courseSelect.value = _courseList[0].key;
+    } else {
+        $courseSelect.value = "";
+    }
+
+    updateCourseSearchDisplay();
+    renderCourseDropdown(getCourseSearchTerm());
+}
+
+function getSelectedCourse() {
+    var key = String($courseSelect && $courseSelect.value || "");
+    if (!key) return null;
+    for (var i = 0; i < _courseList.length; i++) {
+        if (_courseList[i].key === key) return _courseList[i];
+    }
+    return null;
+}
+
+function updateCourseInState(updated) {
+    _courseList = _courseList.map(function (c) {
+        return c.key === updated.key ? updated : c;
+    });
+}
+
+function resolveCourseSelection(course, silent) {
+    if (!course) {
+        return Promise.reject(new Error("Select a registered course first"));
+    }
+
+    if (isValidId(course.courseId) && isValidId(course.registerId)) {
+        syncResolvedIds(course.courseId, course.registerId);
+        return Promise.resolve({ courseId: course.courseId, registerId: course.registerId });
+    }
+
+    $loadCoursesBtn.disabled = true;
+    $courseSelect.disabled = true;
+
+    return ensureBgReady().then(function () {
+        return bgMsgWithActionFallback([
+            "resolveCourseSelection",
+            "resolveSelectedCourse",
+            "resolveCourseIds"
+        ], { selection: course });
+    }).then(function (resp) {
+        var data = resp.data || {};
+        var nextCourse = {
+            key: course.key,
+            name: course.name,
+            courseId: String(data.courseId || ""),
+            registerId: String(data.registerId || ""),
+            courseCandidates: course.courseCandidates || [],
+            registerCandidates: course.registerCandidates || []
+        };
+        updateCourseInState(nextCourse);
+        renderCourseOptions(nextCourse.key);
+        syncResolvedIds(nextCourse.courseId, nextCourse.registerId);
+        if (!silent) {
+            localLog("Resolved IDs for " + course.name + " -> C:" + nextCourse.courseId + " R:" + nextCourse.registerId);
+            loadLogs();
+        }
+        return { courseId: nextCourse.courseId, registerId: nextCourse.registerId };
+    }).finally(function () {
+        $loadCoursesBtn.disabled = false;
+        $courseSelect.disabled = false;
+        if ($courseSearchInput) $courseSearchInput.disabled = false;
+        if ($courseDropdownBtn) $courseDropdownBtn.disabled = false;
+    });
+}
+
+function loadRegisteredCourses(preferredKey, quiet) {
+    if (!$loadCoursesBtn) return Promise.resolve();
+
+    $loadCoursesBtn.disabled = true;
+    $loadCoursesBtn.textContent = "Loading...";
+    if ($courseSearchInput) $courseSearchInput.disabled = true;
+    if ($courseDropdownBtn) $courseDropdownBtn.disabled = true;
+    if (!quiet) {
+        $slotsBox.innerHTML = '<div class="empty-state"><span class="spinner"></span>Loading registered courses…</div>';
+        $slotCount.style.display = "none";
+    }
+
+    return withTimeout(ensureBgReady(), 6000, "Background did not start in time").then(function () {
+        return withTimeout(bgMsgWithActionFallback([
+            "fetchRegisteredCourses",
+            "fetcRegisteredCourses",
+            "fetchRegistredCourses",
+            "fetchCourses"
+        ], {}), 12000, "Loading courses took too long. Please reopen PS tab and try again.");
+    }).then(function (resp) {
+        _courseList = Array.isArray(resp.data) ? resp.data : [];
+        renderCourseOptions(preferredKey || "");
+        if (_courseList.length === 0) {
+            $courseSelect.value = "";
+            syncResolvedIds("", "");
+            if (!quiet) {
+                $slotsBox.innerHTML = '<div class="msg-row info">No registered courses found. Make sure PS session is active.</div>';
+            }
+            return;
+        }
+
+        if (!$courseSelect.value) {
+            $courseSelect.value = _courseList[0].key;
+        }
+
+        chrome.storage.local.set({ selectedCourseKey: $courseSelect.value });
+        var selected = getSelectedCourse();
+        return resolveCourseSelection(selected, true);
+    }).catch(function (err) {
+        if (!quiet) {
+            $slotsBox.innerHTML = '<div class="msg-row error">Failed to load courses: ' + err.message + '</div>';
+        }
+        throw err;
+    }).finally(function () {
+        $loadCoursesBtn.disabled = false;
+        $loadCoursesBtn.textContent = "Load Courses";
+        if ($courseSearchInput) $courseSearchInput.disabled = false;
+        if ($courseDropdownBtn) $courseDropdownBtn.disabled = false;
+    });
+}
+
 // ============================================================
 // INIT
 // ============================================================
@@ -548,7 +806,7 @@ function renderFetchedSlots(slots, matchedSlotId) {
         "courseId", "registerId", "slotTime", "slotDate",
         "slotTimeCustomStart", "slotTimeCustomEnd",
         "firStart", "firEnd",
-        "triggerHour", "triggerMinute", "triggerSecond", "pageReloadEnabled"
+        "triggerHour", "triggerMinute", "triggerSecond", "pageReloadEnabled", "selectedCourseKey"
     ], function (s) {
         if (s.courseId) $courseId.value = s.courseId;
         if (s.registerId) $registerId.value = s.registerId;
@@ -572,6 +830,10 @@ function renderFetchedSlots(slots, matchedSlotId) {
         }
         // Default page reload = OFF (pure API mode)
         $pageReloadToggle.checked = s.pageReloadEnabled === true;
+
+        loadRegisteredCourses(s.selectedCourseKey || "", true).catch(function () {
+            // Keep the popup usable even if course-list API fails initially.
+        });
     });
 
     // 3. Initial status + log
@@ -587,6 +849,84 @@ function renderFetchedSlots(slots, matchedSlotId) {
 // ============================================================
 $courseId.addEventListener("input", function () { chrome.storage.local.set({ courseId: $courseId.value }); });
 $registerId.addEventListener("input", function () { chrome.storage.local.set({ registerId: $registerId.value }); });
+
+if ($courseDropdownBtn) {
+    $courseDropdownBtn.addEventListener("click", function () {
+        if (_courseDropdownOpen) {
+            setCoursePickerOpen(false);
+            return;
+        }
+        renderCourseDropdown(getCourseSearchTerm());
+        setCoursePickerOpen(true);
+        if ($courseSearchInput) $courseSearchInput.focus();
+    });
+}
+
+if ($courseSearchInput) {
+    $courseSearchInput.addEventListener("focus", function () {
+        renderCourseDropdown(getCourseSearchTerm());
+        setCoursePickerOpen(true);
+    });
+
+    $courseSearchInput.addEventListener("input", function () {
+        renderCourseDropdown(getCourseSearchTerm());
+        setCoursePickerOpen(true);
+    });
+
+    $courseSearchInput.addEventListener("keydown", function (e) {
+        if (e.key === "Escape") {
+            setCoursePickerOpen(false);
+            updateCourseSearchDisplay();
+            return;
+        }
+        if (e.key === "Enter") {
+            e.preventDefault();
+            var first = filteredCourses(getCourseSearchTerm())[0];
+            if (!first) return;
+            $courseSelect.value = first.key;
+            chrome.storage.local.set({ selectedCourseKey: first.key });
+            updateCourseSearchDisplay();
+            setCoursePickerOpen(false);
+            $courseSelect.dispatchEvent(new Event("change"));
+        }
+    });
+}
+
+document.addEventListener("click", function (e) {
+    if (!$coursePicker || !$courseOptions) return;
+    if ($coursePicker.contains(e.target) || $courseOptions.contains(e.target)) return;
+    if (_courseDropdownOpen) {
+        setCoursePickerOpen(false);
+        updateCourseSearchDisplay();
+    }
+});
+
+$loadCoursesBtn.addEventListener("click", function () {
+    loadRegisteredCourses($courseSelect.value || "", false).then(function () {
+        localLog("Registered course list refreshed");
+        loadLogs();
+    }).catch(function (err) {
+        localLog("Course load failed: " + err.message);
+        loadLogs();
+    });
+});
+
+$courseSelect.addEventListener("change", function () {
+    chrome.storage.local.set({ selectedCourseKey: $courseSelect.value });
+    updateCourseSearchDisplay();
+    var selected = getSelectedCourse();
+    if (!selected) {
+        syncResolvedIds("", "");
+        return;
+    }
+    resolveCourseSelection(selected, false).catch(function () {
+        syncResolvedIds("", "");
+        $bookResult.style.display = "";
+        $bookResult.className = "result-box err";
+        $bookResult.textContent = "Could not resolve IDs for selected course. Open My Courses in PS portal, click that course card once, then try again.";
+    });
+});
+
 $slotTime.addEventListener("change", function () {
     chrome.storage.local.set({ slotTime: $slotTime.value });
     toggleCustomRangeUI();
@@ -606,12 +946,14 @@ $pageReloadToggle.addEventListener("change", function () {
 // FETCH SLOTS  (GET /available?id=courseId → parse → display)
 // ============================================================
 $fetchBtn.addEventListener("click", function () {
-    var cid = $courseId.value.trim();
-    var rid = $registerId.value.trim();
-    if (!cid) {
-        $slotsBox.innerHTML = '<div class="msg-row error">Enter a Course ID first.</div>';
+    var selected = getSelectedCourse();
+    if (!selected) {
+        $slotsBox.innerHTML = '<div class="msg-row error">Select a registered course first.</div>';
         return;
     }
+
+    var cid = "";
+    var rid = "";
 
     $fetchBtn.disabled = true;
     $fetchBtn.textContent = "Fetching…";
@@ -619,7 +961,14 @@ $fetchBtn.addEventListener("click", function () {
     $slotCount.style.display = "none";
     $bookResult.style.display = "none";
 
-    ensureBgReady().then(function () {
+    resolveCourseSelection(selected, true).then(function (ids) {
+        cid = String(ids.courseId || "").trim();
+        rid = String(ids.registerId || "").trim();
+        if (!cid) {
+            throw new Error("Course ID is missing for selected course");
+        }
+        return ensureBgReady();
+    }).then(function () {
         return bgMsg({ action: "fetchSlots", courseId: cid });
     })
         .then(function (resp) {
@@ -755,53 +1104,72 @@ $bookBtn.addEventListener("click", function () {
 // SCHEDULE
 // ============================================================
 $scheduleBtn.addEventListener("click", function () {
-    var cid = $courseId.value.trim();
-    var rid = $registerId.value.trim();
-    if (!cid || !rid) { setBanner("error", "Fill Course ID and Register ID first"); return; }
+    var selected = getSelectedCourse();
+    if (!selected) { setBanner("error", "Select a registered course first"); return; }
 
-    var t = get24h();
-    var now = new Date();
-    var target = new Date();
-    target.setHours(t.h, t.m, t.s, 0);
-    if (target <= now) target.setDate(target.getDate() + 1);
+    $scheduleBtn.disabled = true;
+    $runNowBtn.disabled = true;
+    $scheduleBtn.textContent = "Scheduling…";
 
-    var targetMs = target.getTime();
-    var delayMin = (target - now) / 60000;
-    var disp = fmt12(t.h, t.m, t.s);
+    resolveCourseSelection(selected, true).then(function (ids) {
+        var cid = String(ids.courseId || "").trim();
+        var rid = String(ids.registerId || "").trim();
+        if (!cid || !rid) throw new Error("Missing Course ID or Register ID for selected course");
 
-    chrome.storage.local.set({
-        courseId: cid,
-        registerId: rid,
-        slotTime: $slotTime.value,
-        slotTimeCustomStart: $customStart.value,
-        slotTimeCustomEnd: $customEnd.value,
-        firStart: $firStart.value,
-        firEnd: $firEnd.value,
-        slotDate: $slotDate.value,
-        autoEnabled: true,
-        triggerHour: t.h,
-        triggerMinute: t.m,
-        triggerSecond: t.s,
-        targetTime: targetMs,
-        autoStatus: "scheduled",
-        autoDetail: "",
-        bookResult: ""
-    }, function () {
-        ensureBgReady().then(function () {
-            return bgMsg({ action: "setAlarm", when: targetMs });
-        })
-            .then(function () {
-                startCD(targetMs);
-                setBanner("scheduled", "Triggers at " + disp + "  ·  Slot: " + slotTimeLabel());
-                localLog("===== SCHEDULED at " + disp + " =====");
-                localLog("Course: " + cid + " | Register: " + rid + " | Slot: " + slotTimeLabel() + " | Date: " + ($slotDate.value || "any") + " | Delay: " + delayMin.toFixed(1) + " min");
-                loadLogs();
+        var t = get24h();
+        var now = new Date();
+        var target = new Date();
+        target.setHours(t.h, t.m, t.s, 0);
+        if (target <= now) target.setDate(target.getDate() + 1);
+
+        var targetMs = target.getTime();
+        var delayMin = (target - now) / 60000;
+        var disp = fmt12(t.h, t.m, t.s);
+
+        chrome.storage.local.set({
+            courseId: cid,
+            registerId: rid,
+            slotTime: $slotTime.value,
+            slotTimeCustomStart: $customStart.value,
+            slotTimeCustomEnd: $customEnd.value,
+            firStart: $firStart.value,
+            firEnd: $firEnd.value,
+            slotDate: $slotDate.value,
+            autoEnabled: true,
+            triggerHour: t.h,
+            triggerMinute: t.m,
+            triggerSecond: t.s,
+            targetTime: targetMs,
+            autoStatus: "scheduled",
+            autoDetail: "",
+            bookResult: ""
+        }, function () {
+            ensureBgReady().then(function () {
+                return bgMsg({ action: "setAlarm", when: targetMs });
             })
-            .catch(function (err) {
-                setBanner("error", "Alarm error: " + err.message);
-                localLog("Alarm error: " + err.message);
-                loadLogs();
-            });
+                .then(function () {
+                    startCD(targetMs);
+                    setBanner("scheduled", "Triggers at " + disp + "  ·  Slot: " + slotTimeLabel());
+                    localLog("===== SCHEDULED at " + disp + " =====");
+                    localLog("Course: " + cid + " | Register: " + rid + " | Slot: " + slotTimeLabel() + " | Date: " + ($slotDate.value || "any") + " | Delay: " + delayMin.toFixed(1) + " min");
+                    loadLogs();
+                })
+                .catch(function (err) {
+                    setBanner("error", "Alarm error: " + err.message);
+                    localLog("Alarm error: " + err.message);
+                    loadLogs();
+                })
+                .finally(function () {
+                    $scheduleBtn.disabled = false;
+                    $runNowBtn.disabled = false;
+                    $scheduleBtn.textContent = "Schedule";
+                });
+        });
+    }).catch(function (err) {
+        setBanner("error", err.message || "Could not resolve selected course");
+        $scheduleBtn.disabled = false;
+        $runNowBtn.disabled = false;
+        $scheduleBtn.textContent = "Schedule";
     });
 });
 
@@ -809,43 +1177,65 @@ $scheduleBtn.addEventListener("click", function () {
 // RUN NOW
 // ============================================================
 $runNowBtn.addEventListener("click", function () {
-    var cid = $courseId.value.trim();
-    var rid = $registerId.value.trim();
-    if (!cid || !rid) { setBanner("error", "Fill Course ID and Register ID first"); return; }
+    var selected = getSelectedCourse();
+    if (!selected) { setBanner("error", "Select a registered course first"); return; }
 
-    stopCD();
-    setBanner("running", "Starting auto-book now…");
+    $runNowBtn.disabled = true;
+    $scheduleBtn.disabled = true;
+    $runNowBtn.textContent = "Starting…";
 
-    chrome.storage.local.set({
-        courseId: cid,
-        registerId: rid,
-        slotTime: $slotTime.value,
-        slotTimeCustomStart: $customStart.value,
-        slotTimeCustomEnd: $customEnd.value,
-        firStart: $firStart.value,
-        firEnd: $firEnd.value,
-        slotDate: $slotDate.value,
-        autoEnabled: true,
-        autoStatus: "running",
-        autoDetail: "Starting…",
-        targetTime: 0
-    }, function () {
-        localLog("=== RUN NOW ===  Course: " + cid + " | Register: " + rid + " | Slot: " + slotTimeLabel() + " | Date: " + ($slotDate.value || "any"));
-        ensureBgReady().then(function () {
-            return bgMsg({ action: "runNow" });
-        })
-            .catch(function (err) {
-                setBanner("error", "Run error: " + err.message);
-                localLog("Run error: " + err.message);
-                chrome.storage.local.set({ autoEnabled: false, autoStatus: "error", autoDetail: err.message, targetTime: 0 }, refreshStatus);
-            });
-        // Frequent poll during active run
-        var pollLimit = 0;
-        var pollId = setInterval(function () {
-            loadLogs(); refreshStatus();
-            pollLimit++;
-            if (pollLimit > 150) clearInterval(pollId);
-        }, 2000);
+    resolveCourseSelection(selected, true).then(function (ids) {
+        var cid = String(ids.courseId || "").trim();
+        var rid = String(ids.registerId || "").trim();
+        if (!cid || !rid) throw new Error("Missing Course ID or Register ID for selected course");
+
+        stopCD();
+        setBanner("running", "Starting auto-book now…");
+
+        chrome.storage.local.set({
+            courseId: cid,
+            registerId: rid,
+            slotTime: $slotTime.value,
+            slotTimeCustomStart: $customStart.value,
+            slotTimeCustomEnd: $customEnd.value,
+            firStart: $firStart.value,
+            firEnd: $firEnd.value,
+            slotDate: $slotDate.value,
+            autoEnabled: true,
+            autoStatus: "running",
+            autoDetail: "Starting…",
+            targetTime: 0
+        }, function () {
+            localLog("=== RUN NOW ===  Course: " + cid + " | Register: " + rid + " | Slot: " + slotTimeLabel() + " | Date: " + ($slotDate.value || "any"));
+            ensureBgReady().then(function () {
+                return bgMsg({ action: "runNow" });
+            })
+                .then(function () {
+                    $runNowBtn.disabled = false;
+                    $scheduleBtn.disabled = false;
+                    $runNowBtn.textContent = "Run Now";
+                })
+                .catch(function (err) {
+                    setBanner("error", "Run error: " + err.message);
+                    localLog("Run error: " + err.message);
+                    chrome.storage.local.set({ autoEnabled: false, autoStatus: "error", autoDetail: err.message, targetTime: 0 }, refreshStatus);
+                    $runNowBtn.disabled = false;
+                    $scheduleBtn.disabled = false;
+                    $runNowBtn.textContent = "Run Now";
+                });
+            // Frequent poll during active run
+            var pollLimit = 0;
+            var pollId = setInterval(function () {
+                loadLogs(); refreshStatus();
+                pollLimit++;
+                if (pollLimit > 150) clearInterval(pollId);
+            }, 2000);
+        });
+    }).catch(function (err) {
+        setBanner("error", err.message || "Could not resolve selected course");
+        $runNowBtn.disabled = false;
+        $scheduleBtn.disabled = false;
+        $runNowBtn.textContent = "Run Now";
     });
 });
 
