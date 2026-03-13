@@ -402,6 +402,13 @@ body {
   color: #fff;
 }
 
+.banner-stop-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  background: transparent;
+  color: var(--red);
+}
+
 /* CARDS */
 .card {
   background: var(--surface);
@@ -1074,4 +1081,82 @@ select option {
   background: rgba(22, 163, 74, 0.07);
   border-color: rgba(22, 163, 74, 0.25);
   color: var(--green);
+}
+
+/* BOOKING PLANS */
+.plan-field {
+  gap: 8px;
+}
+
+.plan-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.plan-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.plan-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 155px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.plan-empty {
+  font-size: 11px;
+  color: var(--text-dim);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface2);
+  padding: 10px;
+  line-height: 1.45;
+}
+
+.plan-item {
+  border: 1px solid var(--border2);
+  border-radius: var(--radius-sm);
+  background: var(--surface2);
+  padding: 8px 10px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.plan-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.35;
+}
+
+.plan-meta {
+  margin-top: 2px;
+  font-size: 10px;
+  color: var(--text-sub);
+  line-height: 1.4;
+}
+
+.plan-remove {
+  border: 1px solid rgba(220, 38, 38, 0.25);
+  background: rgba(220, 38, 38, 0.08);
+  color: var(--red);
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 4px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.plan-remove:hover {
+  background: rgba(220, 38, 38, 0.14);
 }

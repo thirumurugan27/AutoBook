@@ -756,9 +756,40 @@ async function doBookSlot(slotId, registerId) {
 
 // ===== Auto-Book Engine =====
 var retryCount = 0;
-var MAX_RETRIES = 60;
-var RETRY_INTERVAL = 2000;
+var MAX_RETRIES = 5;
+var RETRY_INTERVAL = 1000;
+var EMPTY_SLOT_REFETCH_TRIES = 3;
+var EMPTY_SLOT_REFETCH_WAIT_MS = 900;
 var isRunning = false;
+
+function clearAutoBookAlarm() {
+    return new Promise(function (resolve) {
+        if (!chrome.alarms || typeof chrome.alarms.clear !== "function") {
+            resolve(false);
+            return;
+        }
+        chrome.alarms.clear("autoBookTrigger", function (ok) {
+            resolve(!!ok);
+        });
+    });
+}
+
+function abortAutoBook(detailText, logText) {
+    isRunning = false;
+    stopKeepAlive();
+    return clearAutoBookAlarm().then(function () {
+        return chrome.storage.local.set({
+            autoEnabled: false,
+            autoStatus: "idle",
+            autoDetail: detailText || "Stopped by user",
+            targetTime: 0,
+            bookResult: "",
+            lastMatchedSlotId: null
+        });
+    }).then(function () {
+        if (logText) addLog(logText);
+    });
+}
 
 function setFinalStatus(status, detail, extra) {
     isRunning = false;
@@ -768,211 +799,266 @@ function setFinalStatus(status, detail, extra) {
     return chrome.storage.local.set(data);
 }
 
+function normalizePlanFromConfig(raw) {
+    if (!raw) return null;
+    var cid = toNumString(raw.courseId);
+    var rid = toNumString(raw.registerId);
+    if (!cid || !rid) return null;
+    return {
+        id: String(raw.id || ""),
+        courseName: String(raw.courseName || ("Course " + cid)),
+        courseId: cid,
+        registerId: rid,
+        slotTime: String(raw.slotTime || "any"),
+        slotDate: String(raw.slotDate || ""),
+        slotTimeCustomStart: String(raw.slotTimeCustomStart || ""),
+        slotTimeCustomEnd: String(raw.slotTimeCustomEnd || ""),
+        firStart: String(raw.firStart || ""),
+        firEnd: String(raw.firEnd || "")
+    };
+}
+
+function getEffectivePlans(cfg) {
+    var plans = [];
+    if (Array.isArray(cfg.bookingPlans)) {
+        plans = cfg.bookingPlans.map(normalizePlanFromConfig).filter(Boolean);
+    }
+    if (!plans.length) {
+        var single = normalizePlanFromConfig({
+            courseName: "Selected Course",
+            courseId: cfg.courseId,
+            registerId: cfg.registerId,
+            slotTime: cfg.slotTime,
+            slotDate: cfg.slotDate,
+            slotTimeCustomStart: cfg.slotTimeCustomStart,
+            slotTimeCustomEnd: cfg.slotTimeCustomEnd,
+            firStart: cfg.firStart,
+            firEnd: cfg.firEnd
+        });
+        if (single) plans = [single];
+    }
+    return plans;
+}
+
+function extractSlotIdAny(slot) {
+    return slot.id || slot.slot_id || slot.slotId || slot.slot_Id || slot["_id"] || slot.slotID || null;
+}
+
+function findMatchedSlotForPlan(plan, slots, attempt) {
+    var matched = null;
+    var hasPreference = plan.slotTime && plan.slotTime !== "any";
+
+    if (!hasPreference) {
+        matched = slots[0] || null;
+        if (matched) addLog(attempt + " [" + plan.courseId + "] [FALLBACK] Using first available slot");
+        return { matched: matched, error: "" };
+    }
+
+    if (plan.slotTime === "custom") {
+        var startStr = (plan.slotTimeCustomStart || "").trim();
+        var endStr = (plan.slotTimeCustomEnd || "").trim();
+        var startMin = parseTimeToMinutes(startStr);
+        var endMin = parseTimeToMinutes(endStr);
+        if (!startStr || !endStr || startMin === null || endMin === null || endMin < startMin) {
+            return { matched: null, error: "Invalid custom time range for course " + plan.courseId };
+        }
+        for (var i = 0; i < slots.length; i++) {
+            if (slotMatchesCustomRange(slots[i], startStr, endStr)) {
+                matched = slots[i];
+                break;
+            }
+        }
+    } else if (plan.slotTime === "first-in-range") {
+        var firStartStr = (plan.firStart || "").trim();
+        var firEndStr = (plan.firEnd || "").trim();
+        var firStartMin = parseTimeToMinutes(firStartStr);
+        var firEndMin = parseTimeToMinutes(firEndStr);
+        if (!firStartStr || !firEndStr || firStartMin === null || firEndMin === null || firEndMin < firStartMin) {
+            return { matched: null, error: "Invalid first-in-range window for course " + plan.courseId };
+        }
+        slots.sort(function (a, b) {
+            var aMin = extractSlotStartMinutes(a);
+            var bMin = extractSlotStartMinutes(b);
+            if (aMin === null && bMin === null) return 0;
+            if (aMin === null) return 1;
+            if (bMin === null) return -1;
+            return aMin - bMin;
+        });
+        for (var fi = 0; fi < slots.length; fi++) {
+            if (slotMatchesCustomRange(slots[fi], firStartStr, firEndStr)) {
+                matched = slots[fi];
+                break;
+            }
+        }
+    } else {
+        for (var j = 0; j < slots.length; j++) {
+            if (slotMatchesTime(slots[j], plan.slotTime)) {
+                matched = slots[j];
+                break;
+            }
+        }
+    }
+
+    return { matched: matched, error: "" };
+}
+
 // Single attempt — returns promise resolving to "retry", "done", or "error"
 function runAutoBookOnce() {
-    return chrome.storage.local.get(["courseId", "registerId", "slotTime", "slotDate", "slotTimeCustomStart", "slotTimeCustomEnd", "firStart", "firEnd", "autoEnabled"]).then(function (cfg) {
+    return chrome.storage.local.get(["courseId", "registerId", "slotTime", "slotDate", "slotTimeCustomStart", "slotTimeCustomEnd", "firStart", "firEnd", "bookingPlans", "autoEnabled"]).then(function (cfg) {
+        if (!isRunning) {
+            return "done";
+        }
         if (!cfg.autoEnabled) {
             addLog("[STOPPED] Auto-book disabled.");
             isRunning = false;
             stopKeepAlive();
             return "done";
         }
-        if (!cfg.courseId || !cfg.registerId) {
-            addLog("[ERROR] Missing config — courseId: '" + (cfg.courseId || "") + "', registerId: '" + (cfg.registerId || "") + "'");
+
+        var plans = getEffectivePlans(cfg);
+        if (!plans.length) {
+            addLog("[ERROR] Missing config — no valid course/register plans");
             setFinalStatus("error", "Missing Course ID or Register ID");
             return "error";
         }
 
         retryCount++;
         var attempt = "[Attempt " + retryCount + "/" + MAX_RETRIES + "]";
-        addLog(attempt + " Fetching slots for course #" + cfg.courseId);
+        addLog(attempt + " Checking " + plans.length + " plan(s)");
 
         return chrome.storage.local.set({
             autoStatus: "running",
-            autoDetail: "Fetching slots... (" + retryCount + "/" + MAX_RETRIES + ")"
+            autoDetail: "Checking plans... (" + retryCount + "/" + MAX_RETRIES + ")"
         }).then(function () {
-            return fetchSlotsWithEmptyRetry(cfg.courseId, 10, 700);
-        }).then(function (res) {
-            var data = res.data;
-            var slots = Array.isArray(res.slots) ? res.slots : [];
-            addLog(attempt + " Response type: " + typeof data + ", keys: " + (data ? Object.keys(data).join(",") : "null"));
-            if (res.tries && res.tries > 1) {
-                addLog(attempt + " Empty response retries: " + res.tries);
-            }
+            var planIndex = 0;
+            var hasAnySlot = false;
+            var hasAnyMatch = false;
 
-            addLog(attempt + " Found " + slots.length + " slot(s)");
-            if (slots.length > 0) {
-                addLog(attempt + " Slots: " + JSON.stringify(slots.map(function (s) {
-                    return {
-                        id: s.id || s.slot_id || s.slotId || s.slot_Id || s["_id"],
-                        time: s.time || s.start_time || s.timing || s.slot_time || s.from_time || parseLabelTimeRange(s.label || s.name || ""),
-                        name: s.label || s.name || s.slot_name || s.title,
-                        date: slotDateFromSlot(s)
-                    };
-                })));
-            }
+            function nextPlan() {
+                if (!isRunning) return "done";
 
-            var preferredDate = cfg.slotDate || "";
-            if (preferredDate) {
-                var filtered = slots.filter(function (s) { return slotDateFromSlot(s) === preferredDate; });
-                addLog(attempt + " Date filter: " + preferredDate + " | matched " + filtered.length + " slot(s)");
-                slots = filtered;
-            }
-
-            // Save fetched slots to storage so the popup can show them during scheduled runs
-            chrome.storage.local.set({ lastFetchedSlots: slots.slice(0, 50), lastFetchedAt: Date.now(), lastMatchedSlotId: null });
-
-            // === NO SLOTS ===
-            if (slots.length === 0) {
-                addLog(attempt + " [NO SLOTS] raw: " + JSON.stringify(data).substring(0, 300));
-                if (retryCount < MAX_RETRIES) {
-                    chrome.storage.local.set({ autoStatus: "running", autoDetail: "No slots yet — retry " + retryCount + "/" + MAX_RETRIES });
-                    return "retry";
-                } else {
-                    addLog("======== FINAL: NO SLOTS AVAILABLE ========");
-                    setFinalStatus("no_slots", "No slots available after " + MAX_RETRIES + " attempts");
-                    return "done";
-                }
-            }
-
-            // === FIND MATCHING SLOT ===
-            var matched = null;
-            var hasPreference = cfg.slotTime && cfg.slotTime !== "any";
-            if (hasPreference) {
-                if (cfg.slotTime === "custom") {
-                    var startStr = (cfg.slotTimeCustomStart || "").trim();
-                    var endStr = (cfg.slotTimeCustomEnd || "").trim();
-                    var startMin = parseTimeToMinutes(startStr);
-                    var endMin = parseTimeToMinutes(endStr);
-                    if (!startStr || !endStr || startMin === null || endMin === null || endMin < startMin) {
-                        addLog(attempt + " [ERROR] Invalid custom time range: " + startStr + " to " + endStr);
-                        setFinalStatus("error", "Invalid custom time range");
-                        return "error";
-                    }
-                    for (var i = 0; i < slots.length; i++) {
-                        if (slotMatchesCustomRange(slots[i], startStr, endStr)) {
-                            matched = slots[i];
-                            addLog(attempt + " [MATCH] Custom range: " + JSON.stringify(matched).substring(0, 200));
-                            break;
-                        }
-                    }
-                } else if (cfg.slotTime === "first-in-range") {
-                    var firStartStr = (cfg.firStart || "").trim();
-                    var firEndStr = (cfg.firEnd || "").trim();
-                    var firStartMin = parseTimeToMinutes(firStartStr);
-                    var firEndMin = parseTimeToMinutes(firEndStr);
-                    if (!firStartStr || !firEndStr || firStartMin === null || firEndMin === null || firEndMin < firStartMin) {
-                        addLog(attempt + " [ERROR] Invalid first-in-range: " + firStartStr + " to " + firEndStr);
-                        setFinalStatus("error", "Invalid time range for First in Range");
-                        return "error";
-                    }
-                    // Sort slots by start time (earliest first)
-                    slots.sort(function (a, b) {
-                        var aMin = extractSlotStartMinutes(a);
-                        var bMin = extractSlotStartMinutes(b);
-                        if (aMin === null && bMin === null) return 0;
-                        if (aMin === null) return 1;
-                        if (bMin === null) return -1;
-                        return aMin - bMin;
-                    });
-                    addLog(attempt + " [FIRST-IN-RANGE] Looking in " + firStartStr + " to " + firEndStr + " (sorted by start time)");
-                    for (var fi = 0; fi < slots.length; fi++) {
-                        if (slotMatchesCustomRange(slots[fi], firStartStr, firEndStr)) {
-                            matched = slots[fi];
-                            var matchMin = extractSlotStartMinutes(matched);
-                            addLog(attempt + " [MATCH] First in range (start: " + (matchMin !== null ? matchMin + "min" : "?") + "): " + JSON.stringify(matched).substring(0, 200));
-                            break;
-                        }
-                    }
-                } else {
-                    for (var j = 0; j < slots.length; j++) {
-                        if (slotMatchesTime(slots[j], cfg.slotTime)) {
-                            matched = slots[j];
-                            addLog(attempt + " [MATCH] Preferred: " + JSON.stringify(matched).substring(0, 200));
-                            break;
-                        }
-                    }
-                }
-                if (!matched) {
-                    addLog(attempt + " [NO MATCH] Preferred slot not found in available list");
+                if (planIndex >= plans.length) {
                     if (retryCount < MAX_RETRIES) {
-                        chrome.storage.local.set({ autoStatus: "running", autoDetail: "Preferred slot not available — retry " + retryCount + "/" + MAX_RETRIES });
+                        var noMatchDetail = hasAnySlot
+                            ? "No preferred match yet — retry " + retryCount + "/" + MAX_RETRIES
+                            : "No slots yet — retry " + retryCount + "/" + MAX_RETRIES;
+                        chrome.storage.local.set({ autoStatus: "running", autoDetail: noMatchDetail });
                         return "retry";
                     }
-                    addLog("======== FINAL: PREFERRED SLOT NOT AVAILABLE ========");
-                    setFinalStatus("no_match", "Preferred slot not available after " + MAX_RETRIES + " attempts");
-                    return "done";
-                }
-            } else {
-                matched = slots[0];
-                addLog(attempt + " [FALLBACK] Using first available slot: " + JSON.stringify(matched).substring(0, 200));
-            }
-
-            var sid = matched.id || matched.slot_id || matched.slotId || matched.slot_Id || matched["_id"] || matched.slotID || null;
-            chrome.storage.local.set({ lastMatchedSlotId: sid || null });
-            if (!sid) {
-                addLog(attempt + " [ERROR] No slot ID found in: " + JSON.stringify(matched));
-                setFinalStatus("error", "Slot found but no ID field in response");
-                return "error";
-            }
-
-            // === BOOKING ===
-            addLog(attempt + " [BOOKING] Slot #" + sid + " | register_id: " + cfg.registerId);
-            chrome.storage.local.set({ autoStatus: "running", autoDetail: "Booking slot #" + sid + "..." });
-
-            return doBookSlot(sid, cfg.registerId).then(function (result) {
-                var resStr = JSON.stringify(result);
-                addLog(attempt + " [BOOK RESULT] " + resStr.substring(0, 500));
-
-                // Check for disguised errors
-                var isError = false, errMsg = "";
-                if (result && result.error) { isError = true; errMsg = result.error; }
-                if (result && result.success === false) { isError = true; errMsg = result.message || result.error || resStr; }
-                if (result && result.status === "error") { isError = true; errMsg = result.message || resStr; }
-                if (result && result.raw && typeof result.raw === "string" && result.raw.indexOf("<!DOCTYPE") !== -1) {
-                    isError = true; errMsg = "Server returned HTML page (session expired?)";
-                }
-
-                if (isError) {
-                    addLog("[BOOK FAILED] " + errMsg);
-                    if (retryCount < MAX_RETRIES) {
-                        chrome.storage.local.set({ autoStatus: "running", autoDetail: "Booking rejected: " + errMsg + " — retrying..." });
-                        return "retry";
+                    if (hasAnySlot) {
+                        addLog("======== FINAL: PREFERRED SLOT NOT AVAILABLE ========");
+                        setFinalStatus("no_match", "Preferred slot not available after " + MAX_RETRIES + " attempts");
                     } else {
-                        setFinalStatus("error", "Booking failed: " + errMsg, { bookResult: resStr });
-                        return "done";
+                        addLog("======== FINAL: NO SLOTS AVAILABLE ========");
+                        setFinalStatus("no_slots", "No slots available after " + MAX_RETRIES + " attempts");
                     }
-                }
-
-                // === SUCCESS ===
-                addLog("======================================");
-                addLog("========== SLOT BOOKED! ==========");
-                addLog("======================================");
-                addLog("[BOOKED] Slot #" + sid + " | Time: " + new Date().toLocaleString());
-                addLog("[BOOKED] Response: " + resStr.substring(0, 300));
-                setFinalStatus("booked", "Slot #" + sid + " booked successfully!", { bookResult: resStr });
-                return "done";
-
-            }).catch(function (e) {
-                addLog(attempt + " [BOOK ERROR] " + e.message);
-                if (retryCount < MAX_RETRIES) {
-                    chrome.storage.local.set({ autoStatus: "running", autoDetail: "Book error: " + e.message + " — retrying..." });
-                    return "retry";
-                } else {
-                    setFinalStatus("error", "Booking failed after " + MAX_RETRIES + " attempts: " + e.message);
                     return "done";
                 }
-            });
 
-        }).catch(function (e) {
-            addLog(attempt + " [FETCH ERROR] " + e.message);
-            if (retryCount < MAX_RETRIES) {
-                chrome.storage.local.set({ autoStatus: "running", autoDetail: "Fetch error: " + e.message + " — retrying..." });
-                return "retry";
-            } else {
-                setFinalStatus("error", "Fetch failed after " + MAX_RETRIES + " attempts: " + e.message);
-                return "done";
+                var plan = plans[planIndex++];
+                addLog(attempt + " [PLAN " + planIndex + "/" + plans.length + "] " + plan.courseName + " | C:" + plan.courseId + " R:" + plan.registerId);
+
+                return fetchSlotsWithEmptyRetry(plan.courseId, EMPTY_SLOT_REFETCH_TRIES, EMPTY_SLOT_REFETCH_WAIT_MS).then(function (res) {
+                    if (!isRunning) return "done";
+
+                    var data = res.data;
+                    var slots = Array.isArray(res.slots) ? res.slots : [];
+                    addLog(attempt + " [" + plan.courseId + "] Found " + slots.length + " slot(s)");
+                    if (res.tries && res.tries > 1) {
+                        addLog(attempt + " [" + plan.courseId + "] Empty response retries: " + res.tries);
+                    }
+
+                    if (plan.slotDate) {
+                        slots = slots.filter(function (s) { return slotDateFromSlot(s) === plan.slotDate; });
+                        addLog(attempt + " [" + plan.courseId + "] Date filter: " + plan.slotDate + " | matched " + slots.length + " slot(s)");
+                    }
+
+                    chrome.storage.local.set({ lastFetchedSlots: slots.slice(0, 50), lastFetchedAt: Date.now(), lastMatchedSlotId: null });
+
+                    if (!slots.length) {
+                        addLog(attempt + " [" + plan.courseId + "] [NO SLOTS] raw: " + JSON.stringify(data).substring(0, 220));
+                        return nextPlan();
+                    }
+
+                    hasAnySlot = true;
+                    var matchResult = findMatchedSlotForPlan(plan, slots, attempt);
+                    if (matchResult.error) {
+                        addLog(attempt + " [ERROR] " + matchResult.error);
+                        setFinalStatus("error", matchResult.error);
+                        return "error";
+                    }
+
+                    var matched = matchResult.matched;
+                    if (!matched) {
+                        addLog(attempt + " [" + plan.courseId + "] [NO MATCH] Preferred slot not found");
+                        return nextPlan();
+                    }
+
+                    hasAnyMatch = true;
+                    var sid = extractSlotIdAny(matched);
+                    chrome.storage.local.set({ lastMatchedSlotId: sid || null });
+                    if (!sid) {
+                        addLog(attempt + " [ERROR] No slot ID found in: " + JSON.stringify(matched));
+                        setFinalStatus("error", "Slot found but no ID field in response");
+                        return "error";
+                    }
+
+                    addLog(attempt + " [BOOKING] Slot #" + sid + " | register_id: " + plan.registerId + " | course_id: " + plan.courseId);
+                    chrome.storage.local.set({ autoStatus: "running", autoDetail: "Booking slot #" + sid + "..." });
+
+                    return doBookSlot(sid, plan.registerId).then(function (result) {
+                        if (!isRunning) return "done";
+
+                        var resStr = JSON.stringify(result);
+                        addLog(attempt + " [BOOK RESULT] " + resStr.substring(0, 500));
+
+                        var isError = false, errMsg = "";
+                        if (result && result.error) { isError = true; errMsg = result.error; }
+                        if (result && result.success === false) { isError = true; errMsg = result.message || result.error || resStr; }
+                        if (result && result.status === "error") { isError = true; errMsg = result.message || resStr; }
+                        if (result && result.raw && typeof result.raw === "string" && result.raw.indexOf("<!DOCTYPE") !== -1) {
+                            isError = true; errMsg = "Server returned HTML page (session expired?)";
+                        }
+
+                        if (isError) {
+                            addLog("[BOOK FAILED] " + errMsg);
+                            // Continue to remaining plans in same attempt before retrying.
+                            return nextPlan();
+                        }
+
+                        addLog("======================================");
+                        addLog("========== SLOT BOOKED! ==========");
+                        addLog("======================================");
+                        addLog("[BOOKED] Slot #" + sid + " | Time: " + new Date().toLocaleString());
+                        addLog("[BOOKED] Response: " + resStr.substring(0, 300));
+                        setFinalStatus("booked", "Slot #" + sid + " booked successfully!", { bookResult: resStr });
+                        return "done";
+                    }).catch(function (e) {
+                        addLog(attempt + " [BOOK ERROR] " + e.message);
+                        return nextPlan();
+                    });
+                }).catch(function (e) {
+                    addLog(attempt + " [" + plan.courseId + "] [FETCH ERROR] " + e.message);
+                    return nextPlan();
+                });
             }
+
+            return nextPlan().then(function (result) {
+                if (result === "done" || result === "error" || result === "retry") return result;
+                if (hasAnyMatch && retryCount >= MAX_RETRIES) {
+                    setFinalStatus("error", "Booking failed after " + MAX_RETRIES + " attempts");
+                    return "done";
+                }
+                return "retry";
+            });
+        }).catch(function (e) {
+            addLog(attempt + " [ERROR] " + e.message);
+            if (retryCount < MAX_RETRIES) {
+                chrome.storage.local.set({ autoStatus: "running", autoDetail: "Error: " + e.message + " — retrying..." });
+                return "retry";
+            }
+            setFinalStatus("error", "Failed after " + MAX_RETRIES + " attempts: " + e.message);
+            return "done";
         });
     });
 }
@@ -984,6 +1070,7 @@ function runAutoBookLoop() {
     return runAutoBookOnce().then(function (result) {
         if (result === "retry" && isRunning) {
             return delay(RETRY_INTERVAL).then(function () {
+                if (!isRunning) return;
                 return runAutoBookLoop();
             });
         }
@@ -1009,14 +1096,20 @@ function startAutoBook() {
     addLog("============================================");
     addLog("[START] Time: " + new Date().toLocaleString());
 
-    chrome.storage.local.get(["courseId", "registerId", "slotTime", "slotDate", "slotTimeCustomStart", "slotTimeCustomEnd", "firStart", "firEnd", "pageReloadEnabled"]).then(function (cfg) {
+    chrome.storage.local.get(["courseId", "registerId", "slotTime", "slotDate", "slotTimeCustomStart", "slotTimeCustomEnd", "firStart", "firEnd", "pageReloadEnabled", "bookingPlans"]).then(function (cfg) {
+        if (!isRunning) return;
+
         var pageReloadEnabled = cfg.pageReloadEnabled === true;
-        var slotLabel = cfg.slotTime === "custom"
-            ? ("custom " + (cfg.slotTimeCustomStart || "?") + "–" + (cfg.slotTimeCustomEnd || "?"))
-            : cfg.slotTime === "first-in-range"
-                ? ("first-in-range " + (cfg.firStart || "?") + "–" + (cfg.firEnd || "?"))
-                : (cfg.slotTime || "any");
-        addLog("[CONFIG] Course: " + (cfg.courseId || "?") + " | Register: " + (cfg.registerId || "?") + " | Slot: " + slotLabel + " | Date: " + (cfg.slotDate || "any") + " | PageReload: " + (pageReloadEnabled ? "ON" : "OFF"));
+        var plans = getEffectivePlans(cfg);
+        addLog("[CONFIG] Plans: " + plans.length + " | PageReload: " + (pageReloadEnabled ? "ON" : "OFF"));
+        plans.forEach(function (plan, idx) {
+            var slotLabel = plan.slotTime === "custom"
+                ? ("custom " + (plan.slotTimeCustomStart || "?") + "–" + (plan.slotTimeCustomEnd || "?"))
+                : plan.slotTime === "first-in-range"
+                    ? ("first-in-range " + (plan.firStart || "?") + "–" + (plan.firEnd || "?"))
+                    : (plan.slotTime || "any");
+            addLog("[CONFIG] Plan " + (idx + 1) + ": C:" + plan.courseId + " | R:" + plan.registerId + " | Slot: " + slotLabel + " | Date: " + (plan.slotDate || "any"));
+        });
 
         if (pageReloadEnabled) {
             // Page reload mode: reload once, no waiting, then straight to booking
@@ -1036,6 +1129,7 @@ function startAutoBook() {
                 })
                 .then(function () { return getCookieHeader(); })
                 .then(function (cookieStr) {
+                    if (!isRunning) return;
                     if (!cookieStr) {
                         addLog("[WARNING] No cookies found! Make sure you are logged in at ps.bitsathy.ac.in");
                     } else {
@@ -1048,6 +1142,7 @@ function startAutoBook() {
             return chrome.storage.local.set({ autoStatus: "running", autoDetail: "Starting (API mode)..." })
                 .then(function () { return getCookieHeader(); })
                 .then(function (cookieStr) {
+                    if (!isRunning) return;
                     if (!cookieStr) {
                         addLog("[WARNING] No cookies found! Make sure you are logged in at ps.bitsathy.ac.in");
                     } else {
@@ -1194,10 +1289,7 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
                     respond({ ok: false, error: "Alarms API unavailable. Check manifest permissions." });
                     return;
                 }
-                isRunning = false;
-                stopKeepAlive();
-                chrome.alarms.clear("autoBookTrigger");
-                addLog("Alarm cleared");
+                await abortAutoBook("Alarm cancelled", "Alarm cleared");
                 respond({ ok: true });
                 return;
             }
@@ -1207,11 +1299,7 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
                     respond({ ok: false, error: "Alarms API unavailable. Check manifest permissions." });
                     return;
                 }
-                isRunning = false;
-                stopKeepAlive();
-                chrome.alarms.clear("autoBookTrigger");
-                chrome.storage.local.set({ autoEnabled: false, autoStatus: "idle", autoDetail: "Stopped by user" });
-                addLog("Auto-book stopped by user");
+                await abortAutoBook("Stopped by user", "Auto-book stopped by user");
                 respond({ ok: true });
                 return;
             }

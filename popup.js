@@ -25,6 +25,9 @@ var $cookieStatus = document.getElementById("cookieStatus");
 var $logBox = document.getElementById("logBox");
 var $refreshLogBtn = document.getElementById("refreshLogBtn");
 var $clearLogBtn = document.getElementById("clearLogBtn");
+var $addPlanBtn = document.getElementById("addPlanBtn");
+var $clearPlansBtn = document.getElementById("clearPlansBtn");
+var $planList = document.getElementById("planList");
 var $banner = document.getElementById("statusBanner");
 var $bannerTitle = document.getElementById("statusTitle");
 var $bannerDetail = document.getElementById("statusDetail");
@@ -43,6 +46,8 @@ var $pageReloadToggle = document.getElementById("pageReloadToggle");
 var _lastRenderedFetchAt = 0;
 var _courseList = [];
 var _courseDropdownOpen = false;
+var _bookingPlans = [];
+var _stopInProgress = false;
 
 // ============================================================
 // UTILS
@@ -180,23 +185,120 @@ function fmt24to12(timeStr) {
     return h + ":" + pad(m) + " " + ap;
 }
 
-function slotTimeLabel() {
-    if ($slotTime.value === "custom") {
-        var s = ($customStart.value || "").trim();
-        var e = ($customEnd.value || "").trim();
+function slotTimeLabelFromValues(slotTime, customStart, customEnd, firStartVal, firEndVal) {
+    if (slotTime === "custom") {
+        var s = (customStart || "").trim();
+        var e = (customEnd || "").trim();
         return "Custom " + (s && e ? (fmt24to12(s) + " – " + fmt24to12(e)) : "(incomplete)");
     }
-    if ($slotTime.value === "first-in-range") {
-        var s2 = ($firStart.value || "").trim();
-        var e2 = ($firEnd.value || "").trim();
+    if (slotTime === "first-in-range") {
+        var s2 = (firStartVal || "").trim();
+        var e2 = (firEndVal || "").trim();
         return "First in " + (s2 && e2 ? (fmt24to12(s2) + " – " + fmt24to12(e2)) : "(incomplete)");
     }
-    return $slotTime.value;
+    return slotTime || "any";
+}
+
+function slotTimeLabel() {
+    return slotTimeLabelFromValues($slotTime.value, $customStart.value, $customEnd.value, $firStart.value, $firEnd.value);
 }
 
 function toggleCustomRangeUI() {
     if ($customRangeWrap) $customRangeWrap.style.display = $slotTime.value === "custom" ? "" : "none";
     if ($firstInRangeWrap) $firstInRangeWrap.style.display = $slotTime.value === "first-in-range" ? "" : "none";
+}
+
+function escapeHtml(text) {
+    return String(text || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/\"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
+function buildPlanId() {
+    return "plan_" + Date.now() + "_" + Math.floor(Math.random() * 1000000);
+}
+
+function normalizePlan(plan) {
+    if (!plan) return null;
+    var cid = String(plan.courseId || "").trim();
+    var rid = String(plan.registerId || "").trim();
+    if (!isValidId(cid) || !isValidId(rid)) return null;
+    return {
+        id: String(plan.id || buildPlanId()),
+        courseKey: String(plan.courseKey || ""),
+        courseName: String(plan.courseName || "Course"),
+        courseId: cid,
+        registerId: rid,
+        slotTime: String(plan.slotTime || "any"),
+        slotDate: String(plan.slotDate || ""),
+        slotTimeCustomStart: String(plan.slotTimeCustomStart || ""),
+        slotTimeCustomEnd: String(plan.slotTimeCustomEnd || ""),
+        firStart: String(plan.firStart || ""),
+        firEnd: String(plan.firEnd || "")
+    };
+}
+
+function saveBookingPlans() {
+    return chrome.storage.local.set({ bookingPlans: _bookingPlans });
+}
+
+function renderBookingPlans() {
+    if (!$planList) return;
+    if (!_bookingPlans.length) {
+        $planList.innerHTML = '<div class="plan-empty">No plans yet. Choose course + slot preference, then click Add Current.</div>';
+        return;
+    }
+
+    $planList.innerHTML = "";
+    _bookingPlans.forEach(function (plan, index) {
+        var item = document.createElement("div");
+        item.className = "plan-item";
+        var timeLabel = slotTimeLabelFromValues(plan.slotTime, plan.slotTimeCustomStart, plan.slotTimeCustomEnd, plan.firStart, plan.firEnd);
+        var meta = "#" + (index + 1) + "  |  C:" + plan.courseId + "  R:" + plan.registerId + "  |  " + timeLabel + "  |  Date: " + (plan.slotDate || "any");
+        item.innerHTML =
+            '<div>' +
+            '<div class="plan-title">' + escapeHtml(plan.courseName) + '</div>' +
+            '<div class="plan-meta">' + escapeHtml(meta) + '</div>' +
+            '</div>' +
+            '<button class="plan-remove" data-id="' + escapeHtml(plan.id) + '" type="button">Remove</button>';
+        $planList.appendChild(item);
+    });
+}
+
+function setBookingPlans(nextPlans) {
+    _bookingPlans = (nextPlans || []).map(normalizePlan).filter(Boolean);
+    renderBookingPlans();
+    saveBookingPlans();
+}
+
+function upsertBookingPlan(plan) {
+    var normalized = normalizePlan(plan);
+    if (!normalized) return false;
+
+    var updated = false;
+    _bookingPlans = _bookingPlans.map(function (existing) {
+        if (existing.courseId === normalized.courseId) {
+            updated = true;
+            return Object.assign({}, normalized, { id: existing.id || normalized.id });
+        }
+        return existing;
+    });
+    if (!updated) _bookingPlans.push(normalized);
+    renderBookingPlans();
+    saveBookingPlans();
+    return true;
+}
+
+function removeBookingPlanById(id) {
+    var before = _bookingPlans.length;
+    _bookingPlans = _bookingPlans.filter(function (plan) { return plan.id !== id; });
+    if (_bookingPlans.length !== before) {
+        renderBookingPlans();
+        saveBookingPlans();
+    }
 }
 
 function bgMsg(msg, attempt) {
@@ -784,6 +886,51 @@ function loadRegisteredCourses(preferredKey, quiet) {
     });
 }
 
+function validateSlotPreference(slotTime, customStart, customEnd, firStartVal, firEndVal) {
+    if (slotTime === "custom") {
+        if (!customStart || !customEnd) return "Set both custom start and end time";
+        var cs = parseTimeToMinutesLocal(customStart);
+        var ce = parseTimeToMinutesLocal(customEnd);
+        if (cs === null || ce === null || ce < cs) return "Custom range is invalid";
+    }
+    if (slotTime === "first-in-range") {
+        if (!firStartVal || !firEndVal) return "Set both first-in-range start and end time";
+        var fs = parseTimeToMinutesLocal(firStartVal);
+        var fe = parseTimeToMinutesLocal(firEndVal);
+        if (fs === null || fe === null || fe < fs) return "First-in-range window is invalid";
+    }
+    return "";
+}
+
+function buildCurrentSelectionPlan() {
+    var selected = getSelectedCourse();
+    if (!selected) return Promise.reject(new Error("Select a registered course first"));
+
+    var slotTime = String($slotTime.value || "any");
+    var customStart = String($customStart.value || "");
+    var customEnd = String($customEnd.value || "");
+    var firStartVal = String($firStart.value || "");
+    var firEndVal = String($firEnd.value || "");
+    var preferenceError = validateSlotPreference(slotTime, customStart, customEnd, firStartVal, firEndVal);
+    if (preferenceError) return Promise.reject(new Error(preferenceError));
+
+    return resolveCourseSelection(selected, true).then(function (ids) {
+        return normalizePlan({
+            id: buildPlanId(),
+            courseKey: selected.key,
+            courseName: selected.name,
+            courseId: ids.courseId,
+            registerId: ids.registerId,
+            slotTime: slotTime,
+            slotDate: String($slotDate.value || ""),
+            slotTimeCustomStart: customStart,
+            slotTimeCustomEnd: customEnd,
+            firStart: firStartVal,
+            firEnd: firEndVal
+        });
+    });
+}
+
 // ============================================================
 // INIT
 // ============================================================
@@ -806,7 +953,7 @@ function loadRegisteredCourses(preferredKey, quiet) {
         "courseId", "registerId", "slotTime", "slotDate",
         "slotTimeCustomStart", "slotTimeCustomEnd",
         "firStart", "firEnd",
-        "triggerHour", "triggerMinute", "triggerSecond", "pageReloadEnabled", "selectedCourseKey"
+        "triggerHour", "triggerMinute", "triggerSecond", "pageReloadEnabled", "selectedCourseKey", "bookingPlans"
     ], function (s) {
         if (s.courseId) $courseId.value = s.courseId;
         if (s.registerId) $registerId.value = s.registerId;
@@ -830,6 +977,7 @@ function loadRegisteredCourses(preferredKey, quiet) {
         }
         // Default page reload = OFF (pure API mode)
         $pageReloadToggle.checked = s.pageReloadEnabled === true;
+        setBookingPlans(Array.isArray(s.bookingPlans) ? s.bookingPlans : []);
 
         loadRegisteredCourses(s.selectedCourseKey || "", true).catch(function () {
             // Keep the popup usable even if course-list API fails initially.
@@ -910,6 +1058,48 @@ $loadCoursesBtn.addEventListener("click", function () {
         loadLogs();
     });
 });
+
+if ($addPlanBtn) {
+    $addPlanBtn.addEventListener("click", function () {
+        $addPlanBtn.disabled = true;
+        $addPlanBtn.textContent = "Adding...";
+        buildCurrentSelectionPlan().then(function (plan) {
+            if (!plan) throw new Error("Could not prepare booking plan");
+            var added = upsertBookingPlan(plan);
+            if (!added) throw new Error("Could not store this booking plan");
+            var timeLabel = slotTimeLabelFromValues(plan.slotTime, plan.slotTimeCustomStart, plan.slotTimeCustomEnd, plan.firStart, plan.firEnd);
+            localLog("Plan saved: " + plan.courseName + " | " + timeLabel + " | Date: " + (plan.slotDate || "any"));
+            loadLogs();
+        }).catch(function (err) {
+            $bookResult.style.display = "";
+            $bookResult.className = "result-box err";
+            $bookResult.textContent = err.message;
+        }).finally(function () {
+            $addPlanBtn.disabled = false;
+            $addPlanBtn.textContent = "Add Current";
+        });
+    });
+}
+
+if ($clearPlansBtn) {
+    $clearPlansBtn.addEventListener("click", function () {
+        setBookingPlans([]);
+        localLog("All booking plans cleared");
+        loadLogs();
+    });
+}
+
+if ($planList) {
+    $planList.addEventListener("click", function (e) {
+        var target = e.target;
+        if (!target || !target.classList || !target.classList.contains("plan-remove")) return;
+        var id = String(target.getAttribute("data-id") || "");
+        if (!id) return;
+        removeBookingPlanById(id);
+        localLog("Removed booking plan");
+        loadLogs();
+    });
+}
 
 $courseSelect.addEventListener("change", function () {
     chrome.storage.local.set({ selectedCourseKey: $courseSelect.value });
@@ -1100,21 +1290,88 @@ $bookBtn.addEventListener("click", function () {
         });
 });
 
+function getActivePlansForRun() {
+    if (_bookingPlans.length > 0) {
+        return Promise.resolve(_bookingPlans.slice());
+    }
+    return buildCurrentSelectionPlan().then(function (plan) {
+        if (!plan) throw new Error("Could not prepare selected course plan");
+        return [plan];
+    });
+}
+
+function persistRunConfig(plans, extra, done) {
+    var first = plans[0] || {};
+    var payload = Object.assign({
+        bookingPlans: plans,
+        courseId: String(first.courseId || ""),
+        registerId: String(first.registerId || ""),
+        slotTime: String(first.slotTime || "any"),
+        slotTimeCustomStart: String(first.slotTimeCustomStart || ""),
+        slotTimeCustomEnd: String(first.slotTimeCustomEnd || ""),
+        firStart: String(first.firStart || ""),
+        firEnd: String(first.firEnd || ""),
+        slotDate: String(first.slotDate || "")
+    }, extra || {});
+    chrome.storage.local.set(payload, done);
+}
+
+function setScheduleActionBusy(isBusy) {
+    $scheduleBtn.disabled = !!isBusy;
+    $runNowBtn.disabled = !!isBusy;
+    $cancelBtn.disabled = !!isBusy;
+    if ($bannerStopBtn) $bannerStopBtn.disabled = !!isBusy;
+}
+
+function stopAutomation(source) {
+    if (_stopInProgress) return;
+    _stopInProgress = true;
+
+    stopCD();
+    setScheduleActionBusy(true);
+    $cancelBtn.textContent = "Stopping...";
+    setBanner("running", "Stopping auto-book...");
+
+    ensureBgReady().then(function () {
+        return bgMsg({ action: "stopAutoBook" });
+    }).then(function () {
+        chrome.storage.local.set({
+            autoEnabled: false,
+            autoStatus: "idle",
+            autoDetail: "Stopped by user",
+            targetTime: 0,
+            bookResult: "",
+            lastMatchedSlotId: null
+        }, function () {
+            setBanner("idle", "Stopped by user");
+            localLog("Stopped by user" + (source ? (" (" + source + ")") : "") + ".");
+            loadLogs();
+            refreshStatus();
+        });
+    }).catch(function (err) {
+        chrome.storage.local.set({ autoEnabled: false, autoStatus: "idle", autoDetail: "Stopped (local fallback)", targetTime: 0 }, function () {
+            setBanner("idle", "Stopped");
+            localLog("Stop fallback: " + (err && err.message ? err.message : "unknown error"));
+            loadLogs();
+            refreshStatus();
+        });
+    }).finally(function () {
+        _stopInProgress = false;
+        setScheduleActionBusy(false);
+        $cancelBtn.textContent = "Cancel";
+    });
+}
+
 // ============================================================
 // SCHEDULE
 // ============================================================
 $scheduleBtn.addEventListener("click", function () {
-    var selected = getSelectedCourse();
-    if (!selected) { setBanner("error", "Select a registered course first"); return; }
-
     $scheduleBtn.disabled = true;
     $runNowBtn.disabled = true;
     $scheduleBtn.textContent = "Scheduling…";
 
-    resolveCourseSelection(selected, true).then(function (ids) {
-        var cid = String(ids.courseId || "").trim();
-        var rid = String(ids.registerId || "").trim();
-        if (!cid || !rid) throw new Error("Missing Course ID or Register ID for selected course");
+    getActivePlansForRun().then(function (plans) {
+        if (!plans.length) throw new Error("Add at least one valid booking plan");
 
         var t = get24h();
         var now = new Date();
@@ -1126,15 +1383,7 @@ $scheduleBtn.addEventListener("click", function () {
         var delayMin = (target - now) / 60000;
         var disp = fmt12(t.h, t.m, t.s);
 
-        chrome.storage.local.set({
-            courseId: cid,
-            registerId: rid,
-            slotTime: $slotTime.value,
-            slotTimeCustomStart: $customStart.value,
-            slotTimeCustomEnd: $customEnd.value,
-            firStart: $firStart.value,
-            firEnd: $firEnd.value,
-            slotDate: $slotDate.value,
+        persistRunConfig(plans, {
             autoEnabled: true,
             triggerHour: t.h,
             triggerMinute: t.m,
@@ -1149,9 +1398,13 @@ $scheduleBtn.addEventListener("click", function () {
             })
                 .then(function () {
                     startCD(targetMs);
-                    setBanner("scheduled", "Triggers at " + disp + "  ·  Slot: " + slotTimeLabel());
+                    setBanner("scheduled", "Triggers at " + disp + "  ·  Plans: " + plans.length);
                     localLog("===== SCHEDULED at " + disp + " =====");
-                    localLog("Course: " + cid + " | Register: " + rid + " | Slot: " + slotTimeLabel() + " | Date: " + ($slotDate.value || "any") + " | Delay: " + delayMin.toFixed(1) + " min");
+                    localLog("Plans: " + plans.length + " | Delay: " + delayMin.toFixed(1) + " min");
+                    plans.forEach(function (p, idx) {
+                        var pLabel = slotTimeLabelFromValues(p.slotTime, p.slotTimeCustomStart, p.slotTimeCustomEnd, p.firStart, p.firEnd);
+                        localLog("Plan " + (idx + 1) + ": " + p.courseName + " | C:" + p.courseId + " R:" + p.registerId + " | " + pLabel + " | Date: " + (p.slotDate || "any"));
+                    });
                     loadLogs();
                 })
                 .catch(function (err) {
@@ -1177,36 +1430,27 @@ $scheduleBtn.addEventListener("click", function () {
 // RUN NOW
 // ============================================================
 $runNowBtn.addEventListener("click", function () {
-    var selected = getSelectedCourse();
-    if (!selected) { setBanner("error", "Select a registered course first"); return; }
-
     $runNowBtn.disabled = true;
     $scheduleBtn.disabled = true;
     $runNowBtn.textContent = "Starting…";
 
-    resolveCourseSelection(selected, true).then(function (ids) {
-        var cid = String(ids.courseId || "").trim();
-        var rid = String(ids.registerId || "").trim();
-        if (!cid || !rid) throw new Error("Missing Course ID or Register ID for selected course");
+    getActivePlansForRun().then(function (plans) {
+        if (!plans.length) throw new Error("Add at least one valid booking plan");
 
         stopCD();
-        setBanner("running", "Starting auto-book now…");
+        setBanner("running", "Starting auto-book now for " + plans.length + " plan(s)…");
 
-        chrome.storage.local.set({
-            courseId: cid,
-            registerId: rid,
-            slotTime: $slotTime.value,
-            slotTimeCustomStart: $customStart.value,
-            slotTimeCustomEnd: $customEnd.value,
-            firStart: $firStart.value,
-            firEnd: $firEnd.value,
-            slotDate: $slotDate.value,
+        persistRunConfig(plans, {
             autoEnabled: true,
             autoStatus: "running",
             autoDetail: "Starting…",
             targetTime: 0
         }, function () {
-            localLog("=== RUN NOW ===  Course: " + cid + " | Register: " + rid + " | Slot: " + slotTimeLabel() + " | Date: " + ($slotDate.value || "any"));
+            localLog("=== RUN NOW ===  Plans: " + plans.length);
+            plans.forEach(function (p, idx) {
+                var pLabel = slotTimeLabelFromValues(p.slotTime, p.slotTimeCustomStart, p.slotTimeCustomEnd, p.firStart, p.firEnd);
+                localLog("Plan " + (idx + 1) + ": " + p.courseName + " | C:" + p.courseId + " R:" + p.registerId + " | " + pLabel + " | Date: " + (p.slotDate || "any"));
+            });
             ensureBgReady().then(function () {
                 return bgMsg({ action: "runNow" });
             })
@@ -1223,13 +1467,6 @@ $runNowBtn.addEventListener("click", function () {
                     $scheduleBtn.disabled = false;
                     $runNowBtn.textContent = "Run Now";
                 });
-            // Frequent poll during active run
-            var pollLimit = 0;
-            var pollId = setInterval(function () {
-                loadLogs(); refreshStatus();
-                pollLimit++;
-                if (pollLimit > 150) clearInterval(pollId);
-            }, 2000);
         });
     }).catch(function (err) {
         setBanner("error", err.message || "Could not resolve selected course");
@@ -1243,33 +1480,11 @@ $runNowBtn.addEventListener("click", function () {
 // CANCEL / STOP
 // ============================================================
 $cancelBtn.addEventListener("click", function () {
-    ensureBgReady().then(function () {
-        return bgMsg({ action: "stopAutoBook" });
-    }).catch(function () { });
-    chrome.storage.local.set(
-        { autoEnabled: false, autoStatus: "idle", autoDetail: "Stopped by user", targetTime: 0 },
-        function () {
-            stopCD();
-            setBanner("idle", "Stopped by user");
-            localLog("Cancelled by user.");
-            loadLogs();
-        }
-    );
+    stopAutomation("cancel button");
 });
 
 $bannerStopBtn.addEventListener("click", function () {
-    ensureBgReady().then(function () {
-        return bgMsg({ action: "stopAutoBook" });
-    }).catch(function () { });
-    chrome.storage.local.set(
-        { autoEnabled: false, autoStatus: "idle", autoDetail: "Stopped by user", targetTime: 0 },
-        function () {
-            stopCD();
-            setBanner("idle", "Stopped by user");
-            localLog("Cancelled by user.");
-            loadLogs();
-        }
-    );
+    stopAutomation("banner stop");
 });
 
 // ============================================================

@@ -114,6 +114,20 @@
                 <label>Preferred Slot Date</label>
                 <input id="slotDate" type="date">
             </div>
+            <div class="field plan-field">
+                <div class="plan-head">
+                    <label>Booking Plans (Multi-Course)</label>
+                    <div class="plan-actions">
+                        <button id="addPlanBtn" class="btn-sm btn-ghost" type="button">Add Current</button>
+                        <button id="clearPlansBtn" class="btn-sm btn-ghost" type="button">Clear</button>
+                    </div>
+                </div>
+                <div id="planList" class="plan-list">
+                    <div class="plan-empty">No plans yet. Choose course + slot preference, then click Add Current.</div>
+                </div>
+                <div class="range-help">Schedule and Run Now will use this list in order. If empty, current selection is
+                    used.</div>
+            </div>
         </div>
 
         <!-- ── Available Slots ── -->
