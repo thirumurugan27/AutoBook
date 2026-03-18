@@ -505,9 +505,14 @@ function refreshStatus() {
 // ============================================================
 function loadLogs() {
     chrome.storage.local.get("autoLog", function (r) {
+        var nearBottomThreshold = 24;
+        var distanceFromBottom = $logBox.scrollHeight - ($logBox.scrollTop + $logBox.clientHeight);
+        var shouldStickToBottom = distanceFromBottom <= nearBottomThreshold;
         var logs = r.autoLog || [];
         $logBox.textContent = logs.length ? logs.join("\n") : "No logs yet.";
-        $logBox.scrollTop = $logBox.scrollHeight;
+        if (shouldStickToBottom) {
+            $logBox.scrollTop = $logBox.scrollHeight;
+        }
     });
 }
 

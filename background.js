@@ -750,15 +750,34 @@ async function fetchSlots(courseId) {
 }
 
 async function doBookSlot(slotId, registerId) {
-    var result = await bookSlotViaPage(slotId, registerId);
-    return result;
+    var sid = String(slotId || "").trim();
+    var rid = String(registerId || "").trim();
+    if (!/^\d+$/.test(sid) || !/^\d+$/.test(rid)) {
+        throw new Error("Invalid slot/register ID");
+    }
+
+    var maxAttempts = 2;
+    var lastErr = null;
+    for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            return await bookSlotViaPage(sid, rid);
+        } catch (err) {
+            lastErr = err;
+            var msg = String(err && err.message || "");
+            var retryable = /HTTP\s+5\d\d/i.test(msg) || /something went wrong/i.test(msg);
+            if (!retryable || attempt >= maxAttempts) break;
+            addLog("[BOOK] Server error on attempt " + attempt + "/" + maxAttempts + " - retrying");
+            await delay(350);
+        }
+    }
+    throw lastErr || new Error("Booking failed");
 }
 
 // ===== Auto-Book Engine =====
 var retryCount = 0;
 var MAX_RETRIES = 5;
 var RETRY_INTERVAL = 1000;
-var EMPTY_SLOT_REFETCH_TRIES = 3;
+var EMPTY_SLOT_REFETCH_TRIES = 5;
 var EMPTY_SLOT_REFETCH_WAIT_MS = 900;
 var isRunning = false;
 
