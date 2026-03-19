@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "PS Slot AutoBook",
+  "name": "Auto Book",
   "version": "2.0",
-  "description": "Auto-fetch and book PS slots at scheduled time",
+  "description": "Thambi can do anything for you...",
   "permissions": ["cookies", "storage", "alarms", "tabs", "scripting"],
   "host_permissions": ["https://ps.bitsathy.ac.in/*"],
   "content_scripts": [

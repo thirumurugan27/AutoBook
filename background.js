@@ -775,8 +775,9 @@ async function doBookSlot(slotId, registerId) {
 
 // ===== Auto-Book Engine =====
 var retryCount = 0;
-var MAX_RETRIES = 5;
+var MAX_RETRIES = 10;
 var RETRY_INTERVAL = 1000;
+var MAX_PARALLEL_BOOKINGS = 5;
 var EMPTY_SLOT_REFETCH_TRIES = 5;
 var EMPTY_SLOT_REFETCH_WAIT_MS = 900;
 var isRunning = false;
@@ -823,13 +824,15 @@ function normalizePlanFromConfig(raw) {
     var cid = toNumString(raw.courseId);
     var rid = toNumString(raw.registerId);
     if (!cid || !rid) return null;
+    var useDatePreference = raw.useDatePreference === true || (raw.useDatePreference === undefined && !!raw.slotDate);
     return {
         id: String(raw.id || ""),
         courseName: String(raw.courseName || ("Course " + cid)),
         courseId: cid,
         registerId: rid,
         slotTime: String(raw.slotTime || "any"),
-        slotDate: String(raw.slotDate || ""),
+        useDatePreference: useDatePreference,
+        slotDate: useDatePreference ? String(raw.slotDate || "") : "",
         slotTimeCustomStart: String(raw.slotTimeCustomStart || ""),
         slotTimeCustomEnd: String(raw.slotTimeCustomEnd || ""),
         firStart: String(raw.firStart || ""),
@@ -848,6 +851,7 @@ function getEffectivePlans(cfg) {
             courseId: cfg.courseId,
             registerId: cfg.registerId,
             slotTime: cfg.slotTime,
+            useDatePreference: cfg.useDatePreference,
             slotDate: cfg.slotDate,
             slotTimeCustomStart: cfg.slotTimeCustomStart,
             slotTimeCustomEnd: cfg.slotTimeCustomEnd,
@@ -856,7 +860,7 @@ function getEffectivePlans(cfg) {
         });
         if (single) plans = [single];
     }
-    return plans;
+    return plans.slice(0, MAX_PARALLEL_BOOKINGS);
 }
 
 function extractSlotIdAny(slot) {
@@ -921,9 +925,91 @@ function findMatchedSlotForPlan(plan, slots, attempt) {
     return { matched: matched, error: "" };
 }
 
+function processPlanAttempt(plan, index, total, attempt) {
+    if (!isRunning) {
+        return Promise.resolve({ code: "stopped", hadSlots: false, hadMatch: false });
+    }
+
+    addLog(attempt + " [PLAN " + index + "/" + total + "] " + plan.courseName + " | C:" + plan.courseId + " R:" + plan.registerId);
+
+    return fetchSlotsWithEmptyRetry(plan.courseId, EMPTY_SLOT_REFETCH_TRIES, EMPTY_SLOT_REFETCH_WAIT_MS).then(function (res) {
+        if (!isRunning) return { code: "stopped", hadSlots: false, hadMatch: false };
+
+        var data = res.data;
+        var slots = Array.isArray(res.slots) ? res.slots : [];
+        addLog(attempt + " [" + plan.courseId + "] Found " + slots.length + " slot(s)");
+        if (res.tries && res.tries > 1) {
+            addLog(attempt + " [" + plan.courseId + "] Empty response retries: " + res.tries);
+        }
+
+        if (plan.useDatePreference && plan.slotDate) {
+            slots = slots.filter(function (s) { return slotDateFromSlot(s) === plan.slotDate; });
+            addLog(attempt + " [" + plan.courseId + "] Date filter: " + plan.slotDate + " | matched " + slots.length + " slot(s)");
+        }
+
+        chrome.storage.local.set({ lastFetchedSlots: slots.slice(0, 50), lastFetchedAt: Date.now(), lastMatchedSlotId: null });
+
+        if (!slots.length) {
+            addLog(attempt + " [" + plan.courseId + "] [NO SLOTS] raw: " + JSON.stringify(data).substring(0, 220));
+            return { code: "no_slots", hadSlots: false, hadMatch: false, plan: plan };
+        }
+
+        var matchResult = findMatchedSlotForPlan(plan, slots, attempt);
+        if (matchResult.error) {
+            addLog(attempt + " [ERROR] " + matchResult.error);
+            return { code: "error", hadSlots: true, hadMatch: false, plan: plan, error: matchResult.error };
+        }
+
+        var matched = matchResult.matched;
+        if (!matched) {
+            addLog(attempt + " [" + plan.courseId + "] [NO MATCH] Preferred slot not found");
+            return { code: "no_match", hadSlots: true, hadMatch: false, plan: plan };
+        }
+
+        var sid = extractSlotIdAny(matched);
+        chrome.storage.local.set({ lastMatchedSlotId: sid || null });
+        if (!sid) {
+            addLog(attempt + " [ERROR] No slot ID found in: " + JSON.stringify(matched));
+            return { code: "error", hadSlots: true, hadMatch: true, plan: plan, error: "Slot found but no ID field in response" };
+        }
+
+        addLog(attempt + " [BOOKING] Slot #" + sid + " | register_id: " + plan.registerId + " | course_id: " + plan.courseId);
+        chrome.storage.local.set({ autoStatus: "running", autoDetail: "Booking slot #" + sid + "..." });
+
+        return doBookSlot(sid, plan.registerId).then(function (result) {
+            if (!isRunning) return { code: "stopped", hadSlots: true, hadMatch: true, plan: plan };
+
+            var resStr = JSON.stringify(result);
+            addLog(attempt + " [BOOK RESULT] " + resStr.substring(0, 500));
+
+            var isError = false, errMsg = "";
+            if (result && result.error) { isError = true; errMsg = result.error; }
+            if (result && result.success === false) { isError = true; errMsg = result.message || result.error || resStr; }
+            if (result && result.status === "error") { isError = true; errMsg = result.message || resStr; }
+            if (result && result.raw && typeof result.raw === "string" && result.raw.indexOf("<!DOCTYPE") !== -1) {
+                isError = true; errMsg = "Server returned HTML page (session expired?)";
+            }
+
+            if (isError) {
+                addLog("[BOOK FAILED] " + errMsg);
+                return { code: "book_failed", hadSlots: true, hadMatch: true, plan: plan, sid: sid, error: errMsg };
+            }
+
+            addLog("[BOOKED] Slot #" + sid + " | Course: " + plan.courseId + " | Time: " + new Date().toLocaleString());
+            return { code: "booked", hadSlots: true, hadMatch: true, plan: plan, sid: sid, result: result };
+        }).catch(function (e) {
+            addLog(attempt + " [BOOK ERROR] " + e.message);
+            return { code: "book_failed", hadSlots: true, hadMatch: true, plan: plan, sid: sid, error: e.message };
+        });
+    }).catch(function (e) {
+        addLog(attempt + " [" + plan.courseId + "] [FETCH ERROR] " + e.message);
+        return { code: "fetch_error", hadSlots: false, hadMatch: false, plan: plan, error: e.message };
+    });
+}
+
 // Single attempt — returns promise resolving to "retry", "done", or "error"
 function runAutoBookOnce() {
-    return chrome.storage.local.get(["courseId", "registerId", "slotTime", "slotDate", "slotTimeCustomStart", "slotTimeCustomEnd", "firStart", "firEnd", "bookingPlans", "autoEnabled"]).then(function (cfg) {
+    return chrome.storage.local.get(["courseId", "registerId", "slotTime", "slotDate", "useDatePreference", "slotTimeCustomStart", "slotTimeCustomEnd", "firStart", "firEnd", "bookingPlans", "autoEnabled"]).then(function (cfg) {
         if (!isRunning) {
             return "done";
         }
@@ -949,126 +1035,69 @@ function runAutoBookOnce() {
             autoStatus: "running",
             autoDetail: "Checking plans... (" + retryCount + "/" + MAX_RETRIES + ")"
         }).then(function () {
-            var planIndex = 0;
-            var hasAnySlot = false;
-            var hasAnyMatch = false;
+            var tasks = plans.map(function (plan, idx) {
+                return processPlanAttempt(plan, idx + 1, plans.length, attempt);
+            });
 
-            function nextPlan() {
+            return Promise.all(tasks).then(function (results) {
                 if (!isRunning) return "done";
 
-                if (planIndex >= plans.length) {
-                    if (retryCount < MAX_RETRIES) {
-                        var noMatchDetail = hasAnySlot
-                            ? "No preferred match yet — retry " + retryCount + "/" + MAX_RETRIES
-                            : "No slots yet — retry " + retryCount + "/" + MAX_RETRIES;
-                        chrome.storage.local.set({ autoStatus: "running", autoDetail: noMatchDetail });
-                        return "retry";
-                    }
-                    if (hasAnySlot) {
-                        addLog("======== FINAL: PREFERRED SLOT NOT AVAILABLE ========");
-                        setFinalStatus("no_match", "Preferred slot not available after " + MAX_RETRIES + " attempts");
-                    } else {
-                        addLog("======== FINAL: NO SLOTS AVAILABLE ========");
-                        setFinalStatus("no_slots", "No slots available after " + MAX_RETRIES + " attempts");
-                    }
-                    return "done";
+                var hasAnySlot = results.some(function (r) { return !!(r && r.hadSlots); });
+                var hasAnyMatch = results.some(function (r) { return !!(r && r.hadMatch); });
+                var fatal = results.find(function (r) { return r && r.code === "error"; });
+                var booked = results.filter(function (r) { return r && r.code === "booked"; });
+
+                if (fatal) {
+                    setFinalStatus("error", fatal.error || "Unexpected matching error");
+                    return "error";
                 }
 
-                var plan = plans[planIndex++];
-                addLog(attempt + " [PLAN " + planIndex + "/" + plans.length + "] " + plan.courseName + " | C:" + plan.courseId + " R:" + plan.registerId);
+                if (booked.length > 0) {
+                    addLog("======================================");
+                    addLog("========== SLOT BOOKED! ==========");
+                    addLog("======================================");
 
-                return fetchSlotsWithEmptyRetry(plan.courseId, EMPTY_SLOT_REFETCH_TRIES, EMPTY_SLOT_REFETCH_WAIT_MS).then(function (res) {
-                    if (!isRunning) return "done";
-
-                    var data = res.data;
-                    var slots = Array.isArray(res.slots) ? res.slots : [];
-                    addLog(attempt + " [" + plan.courseId + "] Found " + slots.length + " slot(s)");
-                    if (res.tries && res.tries > 1) {
-                        addLog(attempt + " [" + plan.courseId + "] Empty response retries: " + res.tries);
-                    }
-
-                    if (plan.slotDate) {
-                        slots = slots.filter(function (s) { return slotDateFromSlot(s) === plan.slotDate; });
-                        addLog(attempt + " [" + plan.courseId + "] Date filter: " + plan.slotDate + " | matched " + slots.length + " slot(s)");
-                    }
-
-                    chrome.storage.local.set({ lastFetchedSlots: slots.slice(0, 50), lastFetchedAt: Date.now(), lastMatchedSlotId: null });
-
-                    if (!slots.length) {
-                        addLog(attempt + " [" + plan.courseId + "] [NO SLOTS] raw: " + JSON.stringify(data).substring(0, 220));
-                        return nextPlan();
-                    }
-
-                    hasAnySlot = true;
-                    var matchResult = findMatchedSlotForPlan(plan, slots, attempt);
-                    if (matchResult.error) {
-                        addLog(attempt + " [ERROR] " + matchResult.error);
-                        setFinalStatus("error", matchResult.error);
-                        return "error";
-                    }
-
-                    var matched = matchResult.matched;
-                    if (!matched) {
-                        addLog(attempt + " [" + plan.courseId + "] [NO MATCH] Preferred slot not found");
-                        return nextPlan();
-                    }
-
-                    hasAnyMatch = true;
-                    var sid = extractSlotIdAny(matched);
-                    chrome.storage.local.set({ lastMatchedSlotId: sid || null });
-                    if (!sid) {
-                        addLog(attempt + " [ERROR] No slot ID found in: " + JSON.stringify(matched));
-                        setFinalStatus("error", "Slot found but no ID field in response");
-                        return "error";
-                    }
-
-                    addLog(attempt + " [BOOKING] Slot #" + sid + " | register_id: " + plan.registerId + " | course_id: " + plan.courseId);
-                    chrome.storage.local.set({ autoStatus: "running", autoDetail: "Booking slot #" + sid + "..." });
-
-                    return doBookSlot(sid, plan.registerId).then(function (result) {
-                        if (!isRunning) return "done";
-
-                        var resStr = JSON.stringify(result);
-                        addLog(attempt + " [BOOK RESULT] " + resStr.substring(0, 500));
-
-                        var isError = false, errMsg = "";
-                        if (result && result.error) { isError = true; errMsg = result.error; }
-                        if (result && result.success === false) { isError = true; errMsg = result.message || result.error || resStr; }
-                        if (result && result.status === "error") { isError = true; errMsg = result.message || resStr; }
-                        if (result && result.raw && typeof result.raw === "string" && result.raw.indexOf("<!DOCTYPE") !== -1) {
-                            isError = true; errMsg = "Server returned HTML page (session expired?)";
-                        }
-
-                        if (isError) {
-                            addLog("[BOOK FAILED] " + errMsg);
-                            // Continue to remaining plans in same attempt before retrying.
-                            return nextPlan();
-                        }
-
-                        addLog("======================================");
-                        addLog("========== SLOT BOOKED! ==========");
-                        addLog("======================================");
-                        addLog("[BOOKED] Slot #" + sid + " | Time: " + new Date().toLocaleString());
-                        addLog("[BOOKED] Response: " + resStr.substring(0, 300));
-                        setFinalStatus("booked", "Slot #" + sid + " booked successfully!", { bookResult: resStr });
-                        return "done";
-                    }).catch(function (e) {
-                        addLog(attempt + " [BOOK ERROR] " + e.message);
-                        return nextPlan();
+                    var bookedSummary = booked.map(function (r) {
+                        return {
+                            courseId: r.plan && r.plan.courseId,
+                            registerId: r.plan && r.plan.registerId,
+                            slotId: r.sid,
+                            response: r.result
+                        };
                     });
-                }).catch(function (e) {
-                    addLog(attempt + " [" + plan.courseId + "] [FETCH ERROR] " + e.message);
-                    return nextPlan();
-                });
-            }
+                    var detail = booked.length === 1
+                        ? ("Slot #" + booked[0].sid + " booked successfully!")
+                        : (booked.length + " slots booked successfully!");
 
-            return nextPlan().then(function (result) {
-                if (result === "done" || result === "error" || result === "retry") return result;
-                if (hasAnyMatch && retryCount >= MAX_RETRIES) {
-                    setFinalStatus("error", "Booking failed after " + MAX_RETRIES + " attempts");
+                    addLog("[BOOKED] Success count: " + booked.length + " / " + plans.length);
+                    setFinalStatus("booked", detail, { bookResult: JSON.stringify(bookedSummary) });
                     return "done";
                 }
-                return "retry";
+
+                if (retryCount < MAX_RETRIES) {
+                    var retryDetail = hasAnyMatch
+                        ? ("Booking failed — retry " + retryCount + "/" + MAX_RETRIES)
+                        : hasAnySlot
+                            ? ("No preferred match yet — retry " + retryCount + "/" + MAX_RETRIES)
+                            : ("No slots yet — retry " + retryCount + "/" + MAX_RETRIES);
+                    chrome.storage.local.set({ autoStatus: "running", autoDetail: retryDetail });
+                    return "retry";
+                }
+
+                if (hasAnyMatch) {
+                    addLog("======== FINAL: MATCH FOUND BUT BOOKING FAILED ========");
+                    setFinalStatus("error", "Matched slot(s) found but booking failed after " + MAX_RETRIES + " attempts");
+                    return "done";
+                }
+
+                if (hasAnySlot) {
+                    addLog("======== FINAL: PREFERRED SLOT NOT AVAILABLE ========");
+                    setFinalStatus("no_match", "Preferred slot not available after " + MAX_RETRIES + " attempts");
+                } else {
+                    addLog("======== FINAL: NO SLOTS AVAILABLE ========");
+                    setFinalStatus("no_slots", "No slots available after " + MAX_RETRIES + " attempts");
+                }
+                return "done";
             });
         }).catch(function (e) {
             addLog(attempt + " [ERROR] " + e.message);
@@ -1115,7 +1144,7 @@ function startAutoBook() {
     addLog("============================================");
     addLog("[START] Time: " + new Date().toLocaleString());
 
-    chrome.storage.local.get(["courseId", "registerId", "slotTime", "slotDate", "slotTimeCustomStart", "slotTimeCustomEnd", "firStart", "firEnd", "pageReloadEnabled", "bookingPlans"]).then(function (cfg) {
+    chrome.storage.local.get(["courseId", "registerId", "slotTime", "slotDate", "useDatePreference", "slotTimeCustomStart", "slotTimeCustomEnd", "firStart", "firEnd", "pageReloadEnabled", "bookingPlans"]).then(function (cfg) {
         if (!isRunning) return;
 
         var pageReloadEnabled = cfg.pageReloadEnabled === true;
@@ -1127,7 +1156,7 @@ function startAutoBook() {
                 : plan.slotTime === "first-in-range"
                     ? ("first-in-range " + (plan.firStart || "?") + "–" + (plan.firEnd || "?"))
                     : (plan.slotTime || "any");
-            addLog("[CONFIG] Plan " + (idx + 1) + ": C:" + plan.courseId + " | R:" + plan.registerId + " | Slot: " + slotLabel + " | Date: " + (plan.slotDate || "any"));
+            addLog("[CONFIG] Plan " + (idx + 1) + ": C:" + plan.courseId + " | R:" + plan.registerId + " | Slot: " + slotLabel + " | Date: " + (plan.useDatePreference ? (plan.slotDate || "not set") : "off"));
         });
 
         if (pageReloadEnabled) {
